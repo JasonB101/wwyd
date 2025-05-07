@@ -7,6 +7,8 @@ import { Room } from './models/Room';
 import dotenv from 'dotenv';
 import { AIService } from './lib/ai/aiService';
 import { GameCategory, JudgingStyle, GameState } from './types/gameState';
+import { v4 as uuidv4 } from 'uuid';
+import mongoose from 'mongoose';
 
 // Load environment variables
 dotenv.config({ path: '.env.local' });
@@ -43,6 +45,74 @@ interface RoundHistoryItem {
   explanation: string;
 }
 
+// At the top of the file, before app.prepare(), add a simple cache for room data
+// Simple in-memory cache for rooms to reduce database queries
+const roomCache = new Map<string, { data: any, timestamp: number }>();
+const CACHE_TTL = 2000; // 2 seconds TTL for cache
+
+// Track rooms with pending deletion (roomCode -> timeout ID)
+const pendingRoomDeletions = new Map<string, NodeJS.Timeout>();
+const ROOM_DELETION_DELAY = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// Helper function to get room with cache
+async function getRoomWithCache(roomCode: string, forceFresh: boolean = false): Promise<any> {
+  // Skip cache if force fresh is requested
+  if (forceFresh) {
+    console.log(`Fetching fresh room data for ${roomCode} (cache bypassed)`);
+    const room = await Room.findOne({ code: roomCode });
+    if (room) {
+      // Update cache with fresh data
+      roomCache.set(roomCode, { data: room, timestamp: Date.now() });
+    }
+    return room;
+  }
+
+  // Check if we have a valid cache entry
+  const cachedRoom = roomCache.get(roomCode);
+  if (cachedRoom && (Date.now() - cachedRoom.timestamp) < CACHE_TTL) {
+    console.log(`Using cached room data for ${roomCode} (age: ${Date.now() - cachedRoom.timestamp}ms)`);
+    return cachedRoom.data;
+  }
+
+  // No valid cache, fetch from database
+  console.log(`Cache miss for room ${roomCode}, fetching from database`);
+  const room = await Room.findOne({ code: roomCode });
+  if (room) {
+    // Update cache with fresh data
+    roomCache.set(roomCode, { data: room, timestamp: Date.now() });
+  }
+  return room;
+}
+
+// Helper function to invalidate cache when a room is updated
+function invalidateRoomCache(roomCode: string) {
+  console.log(`Invalidating cache for room ${roomCode}`);
+  roomCache.delete(roomCode);
+}
+
+// Helper function to broadcast room updates once
+async function broadcastRoomUpdate(roomCode: string, room: any): Promise<void> {
+  console.log(`Broadcasting room update to room ${roomCode} (${room.players.length} players)`);
+  
+  const formattedRoom = formatRoomForClient(room);
+  
+  // Return a promise that resolves when the broadcast is complete
+  return new Promise<void>((resolve) => {
+    io.to(roomCode).emit('roomUpdate', formattedRoom);
+    
+    // Fetch socket count for debugging (don't block on this)
+    io.in(roomCode).fetchSockets()
+      .then(sockets => {
+        console.log(`Room update sent to ${sockets.length} sockets in room ${roomCode}`);
+        resolve(); // Resolve the promise
+      })
+      .catch(err => {
+        console.error('Error fetching socket count:', err);
+        resolve(); // Resolve even on error
+      });
+  });
+}
+
 // Next.js setup
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });
@@ -57,602 +127,685 @@ if (!process.env.MONGODB_URI) {
 // Define io at a higher scope so it's available to helper functions
 let io: SocketIOServer;
 
-app.prepare().then(() => {
-  console.log('Next.js app prepared');
-  
-  // Create HTTP server
-  const server = createServer((req, res) => {
-    const parsedUrl = parse(req.url!, true);
-    handle(req, res, parsedUrl);
-  });
+// Helper function to format room for client
+function formatRoomForClient(room: any) {
+  if (!room) return null;
+  // Return a simplified version of the room without sensitive info
+  return {
+    code: room.code,
+    status: room.status,
+    players: room.players,
+    currentRound: room.currentRound,
+    game: room.game
+  };
+}
 
-  // Initialize Socket.IO
-  console.log('Initializing Socket.IO server...');
-  io = new SocketIOServer(server, {
-    cors: {
-      origin: '*',
-      methods: ['GET', 'POST']
-    },
-    path: '/socket.io',
-    transports: ['websocket', 'polling']
-  });
+// Add timeout protection for Next.js app preparation
+const nextJsTimeout = setTimeout(() => {
+  console.error('Next.js preparation is taking too long (>30s). This may indicate a problem with webpack or caching.');
+  console.error('You may want to run `npm run clean` and restart the server.');
+}, 30000);
 
-  // Track socket to player ID mapping
-  const socketToPlayer = new Map<string, SocketPlayerInfo>();
-
-  // Connect to MongoDB
-  connectToDatabase().catch(error => {
-    console.error('Failed to connect to MongoDB:', error);
-    process.exit(1);
-  });
-  
-  /**
-   * Socket connection handler
-   */
-  io.on('connection', (socket) => {
-    console.log('New socket connection:', socket.id);
+// Prepare Next.js app with better error handling
+app.prepare()
+  .then(() => {
+    clearTimeout(nextJsTimeout);
+    console.log('Next.js app prepared successfully');
     
-    // Get player info from query parameters
-    const queryInfo = socket.handshake.query;
-    const playerId = queryInfo.playerId;
-    const roomCode = queryInfo.roomCode;
-    const nickname = queryInfo.nickname;
-
-    // Register player if all required info is provided
-    if (playerId && roomCode && nickname) {
-      const playerIdStr = Array.isArray(playerId) ? playerId[0] : playerId;
-      const roomCodeStr = Array.isArray(roomCode) ? roomCode[0] : roomCode;
-      const nicknameStr = Array.isArray(nickname) ? nickname[0] : nickname;
-
-      // Check if this socket is already connected for this player
-      for (const [existingSocketId, playerInfo] of socketToPlayer.entries()) {
-        if (playerInfo.playerId === playerIdStr && existingSocketId !== socket.id) {
-          console.log(`Disconnecting duplicate socket for player: ${playerIdStr}`);
-          const existingSocket = io.sockets.sockets.get(existingSocketId);
-          if (existingSocket) {
-            existingSocket.disconnect();
-          }
-          socketToPlayer.delete(existingSocketId);
-        }
+    // Create HTTP server
+    const server = createServer((req, res) => {
+      try {
+        const parsedUrl = parse(req.url!, true);
+        handle(req, res, parsedUrl);
+      } catch (error) {
+        console.error('Error handling request:', error);
+        res.statusCode = 500;
+        res.end('Internal Server Error');
       }
+    });
 
-      // Store player info in socket mapping
-      socketToPlayer.set(socket.id, {
-        playerId: playerIdStr,
-        roomCode: roomCodeStr,
-        nickname: nicknameStr
-      });
+    // Initialize Socket.IO
+    console.log('Initializing Socket.IO server...');
+    io = new SocketIOServer(server, {
+      cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+      },
+      path: '/socket.io',
+      transports: ['websocket', 'polling']
+    });
 
-      // Join the room immediately
-      socket.join(roomCodeStr);
-      console.log(`Socket ${socket.id} joined room ${roomCodeStr}`);
+    // Track socket to player ID mapping
+    const socketToPlayer = new Map<string, SocketPlayerInfo>();
+
+    /**
+     * Diagnostic function to log all sockets in a room
+     */
+    function logSocketsInRoom(roomCode: string) {
+      try {
+        const room = io.sockets.adapter.rooms.get(roomCode);
+        if (!room) {
+          console.log(`No sockets found in room ${roomCode}`);
+          return;
+        }
+        
+        const socketsInRoom = Array.from(room);
+        console.log(`Sockets in room ${roomCode}: ${socketsInRoom.length}`);
+        
+        // Log details about each socket
+        socketsInRoom.forEach(socketId => {
+          const playerInfo = socketToPlayer.get(socketId);
+          if (playerInfo) {
+            console.log(`  - Socket ${socketId}: Player ${playerInfo.nickname} (${playerInfo.playerId}), ${playerInfo.playerId ? 'isConnected' : 'not connected'}`);
+          } else {
+            console.log(`  - Socket ${socketId}: No player info found`);
+          }
+        });
+      } catch (error) {
+        console.error('Error logging sockets in room:', error);
+      }
     }
+
+    // Connect to MongoDB
+    connectToDatabase().catch(error => {
+      console.error('Failed to connect to MongoDB:', error);
+      process.exit(1);
+    });
     
     /**
-     * Join room event handler
-     * Adds a player to a room and broadcasts the update to all players
+     * Socket connection handler
      */
-    socket.on('joinRoom', async (roomCode: string, playerId: string, nickname: string) => {
-      console.log(`Join room: ${roomCode}, Player: ${nickname} (${playerId})`);
+    io.on('connection', (socket) => {
+      console.log('New socket connection:', socket.id);
       
-      try {
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room with a fresh query to get the latest state
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          socket.emit('error', 'Room not found');
-          return;
-        }
+      // Get player info from query parameters
+      const queryInfo = socket.handshake.query;
+      const playerId = queryInfo.playerId;
+      const roomCode = queryInfo.roomCode;
+      const nickname = queryInfo.nickname;
 
-        // Check if player is already in the room by ID (handles reconnections)
-        const existingPlayerById = room.players.find((p: Player) => p.id === playerId);
-        if (existingPlayerById) {
-          console.log(`Player ${nickname} already in room ${roomCode} by ID, marking as connected`);
-          
-          // Update their connection status
-          await Room.updateOne(
-            { code: roomCode, 'players.id': playerId },
-            { $set: { 'players.$.isConnected': true } }
-          );
-          
-          // Join the socket to the room
-          socket.join(roomCode);
-          socketToPlayer.set(socket.id, { playerId, roomCode, nickname });
-          
-          // Get the updated room
-          const updatedRoom = await Room.findOne({ code: roomCode });
-          if (!updatedRoom) {
-            console.log('Failed to get updated room');
-            return;
-          }
-          
-          // Send room update to the reconnecting player first
-          socket.emit('roomUpdate', updatedRoom);
-          
-          // If the game is in answering state, also send current time
-          if (updatedRoom.gameState && updatedRoom.gameState.status === 'answering' && 
-              updatedRoom.gameState.timeRemaining) {
-            console.log(`Sending current time to reconnected player: ${updatedRoom.gameState.timeRemaining}s`);
-            socket.emit('timeUpdate', updatedRoom.gameState.timeRemaining);
-          }
-          
-          // Then to all other players
-          socket.to(roomCode).emit('roomUpdate', updatedRoom);
-          console.log(`Room update sent for reconnected player ${nickname}`);
-          return;
-        }
-        
-        // Check for duplicate nickname
-        const existingPlayerByNickname = room.players.find(
-          (p: Player) => p.nickname.toLowerCase() === nickname.toLowerCase() && p.id !== playerId
-        );
-        if (existingPlayerByNickname) {
-          console.log(`Nickname ${nickname} already taken in room ${roomCode}`);
-          socket.emit('error', 'This nickname is already taken in this room');
-          return;
-        }
+      // Register player if all required info is provided
+      if (playerId && roomCode && nickname) {
+        const playerIdStr = Array.isArray(playerId) ? playerId[0] : playerId;
+        const roomCodeStr = Array.isArray(roomCode) ? roomCode[0] : roomCode;
+        const nicknameStr = Array.isArray(nickname) ? nickname[0] : nickname;
 
-        // Add new player to room
-        const shouldBeHost = room.players.length === 0;
-        console.log(`Adding player ${nickname} to room ${roomCode}, host: ${shouldBeHost}`);
-        
-        const updatedRoom = await Room.findOneAndUpdate(
-          { code: roomCode },
-          {
-            $push: {
-              players: {
-                id: playerId,
-                nickname,
-                isHost: shouldBeHost,
-                isConnected: true
-              }
+        console.log(`Socket ${socket.id} authenticated for player ${nicknameStr} (${playerIdStr}) in room ${roomCodeStr}`);
+
+        // Check if this socket is already connected for this player
+        for (const [existingSocketId, playerInfo] of socketToPlayer.entries()) {
+          if (playerInfo.playerId === playerIdStr && existingSocketId !== socket.id) {
+            console.log(`Disconnecting duplicate socket for player: ${playerIdStr}`);
+            const existingSocket = io.sockets.sockets.get(existingSocketId);
+            if (existingSocket) {
+              existingSocket.disconnect();
             }
-          },
-          { new: true }
-        );
-
-        if (!updatedRoom) {
-          console.log('Failed to update room:', { roomCode, playerId });
-          socket.emit('error', 'Failed to join room');
-          return;
+            socketToPlayer.delete(existingSocketId);
+          }
         }
 
         // Store player info in socket mapping
-        socket.join(roomCode);
-        socketToPlayer.set(socket.id, { playerId, roomCode, nickname });
-
-        // Log the updated player count
-        console.log(`Room ${roomCode} updated: ${updatedRoom.players.length} players`);
-
-        // Notify all players in the room
-        io.to(roomCode).emit('roomUpdate', updatedRoom);
-        console.log('Room update emitted to all players');
-        
-        // If the game is in answering state, also send current time to the new player
-        if (updatedRoom.gameState && updatedRoom.gameState.status === 'answering' && 
-            updatedRoom.gameState.timeRemaining) {
-          console.log(`Sending current time to new player: ${updatedRoom.gameState.timeRemaining}s`);
-          socket.emit('timeUpdate', updatedRoom.gameState.timeRemaining);
-        }
-      } catch (error) {
-        console.error('Error in joinRoom handler:', error);
-        socket.emit('error', 'Server error when joining room');
-      }
-    });
-
-    /**
-     * Leave room event handler
-     * Removes a player from a room, reassigns host if needed, and broadcasts the update
-     */
-    socket.on('leaveRoom', async (roomCode: string) => {
-      console.log(`Leave room event: ${roomCode}, Socket: ${socket.id}`);
-      
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
-        }
-
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room to verify the player exists
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          return;
-        }
-
-        // Find the leaving player
-        const leavingPlayer = room.players.find((p: Player) => p.id === playerInfo.playerId);
-        if (!leavingPlayer) {
-          console.log('Player not found in room');
-          return;
-        }
-
-        console.log(`${leavingPlayer.nickname} is leaving room ${roomCode}`);
-        const wasHost = leavingPlayer.isHost;
-
-        // Remove the player from the room
-        const updatedRoom = await Room.findOneAndUpdate(
-          { code: roomCode },
-          {
-            $pull: { players: { id: playerInfo.playerId } }
-          },
-          { new: true }
-        );
-
-        if (!updatedRoom) {
-          console.log('Failed to update room');
-          return;
-        }
-
-        // If the leaving player was the host and there are other players, assign a new host
-        if (wasHost && updatedRoom.players.length > 0) {
-          const newHostRoom = await Room.findOneAndUpdate(
-            { code: roomCode },
-            {
-              $set: { 'players.0.isHost': true }
-            },
-            { new: true }
-          );
-
-          if (newHostRoom) {
-            console.log(`New host assigned: ${newHostRoom.players[0].nickname}`);
-            
-            // Use the updated room with the new host
-            updatedRoom.players[0].isHost = true;
-          }
-        }
-
-        if (updatedRoom.players.length === 0) {
-          // If no players left, delete the room
-          await Room.deleteOne({ code: roomCode });
-          console.log(`Room ${roomCode} deleted (no players remaining)`);
-          io.to(roomCode).emit('roomEnded', 'Room has been closed');
-        } else {
-          // Notify remaining players
-          io.to(roomCode).emit('roomUpdate', updatedRoom);
-          console.log(`Room update sent to ${updatedRoom.players.length} remaining players`);
-        }
-      } catch (error) {
-        console.error('Error in leaveRoom handler:', error);
-      } finally {
-        // Clean up socket connection
-        socketToPlayer.delete(socket.id);
-        socket.leave(roomCode);
-        socket.disconnect();
-      }
-    });
-
-    /**
-     * Start game event handler
-     * Initiates the game when the host clicks the Begin button
-     */
-    socket.on('startGame', async () => {
-      console.log('Start game event received');
-      
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
-        }
-
-        const { roomCode, playerId } = playerInfo;
-        
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          return;
-        }
-
-        // Verify the player is the host
-        const hostPlayer = room.players.find((p: Player) => p.id === playerId);
-        if (!hostPlayer || !hostPlayer.isHost) {
-          console.log('Only the host can start the game');
-          return;
-        }
-
-        if (room.players.length < 2) {
-          console.log('Need at least 2 players to start the game');
-          return;
-        }
-
-        // Initialize scores for all players
-        const initialScores: Record<string, number> = {};
-        room.players.forEach((player: Player) => {
-          initialScores[player.id] = 0;
+        socketToPlayer.set(socket.id, {
+          playerId: playerIdStr,
+          roomCode: roomCodeStr,
+          nickname: nicknameStr
         });
 
-        // Get available categories
-        const allCategories: GameCategory[] = ['business', 'scenario', 'wouldYouRather', 'pleadForYourLife', 'escape'];
+        // Join the room immediately
+        socket.join(roomCodeStr);
+        console.log(`Socket ${socket.id} joined room ${roomCodeStr}`);
         
-        // Find player with lowest score (for first round, randomly select)
-        const randomPlayerIndex = Math.floor(Math.random() * room.players.length);
-        const categorySelector = room.players[randomPlayerIndex].id;
-
-        // Initialize the game state
-        const initialGameState: GameState = {
-          status: 'category-selection',
-          round: 1,
-          totalRounds: 5,
-          scores: initialScores,
-          answers: {},
-          categorySelector,
-          categories: allCategories,
-          roundHistory: []
-        };
-
-        // Update room status to playing and set initial game state
-        const updatedRoom = await Room.findOneAndUpdate(
-          { code: roomCode },
-          { 
-            $set: { 
-              status: 'playing',
-              currentRound: 1,
-              gameState: initialGameState
-            } 
-          },
-          { new: true }
-        );
-
-        if (!updatedRoom) {
-          console.log('Failed to update room status');
-          return;
-        }
-
-        console.log(`Game started in room ${roomCode}, round 1`);
-        
-        // Notify all players that the game has started
-        io.to(roomCode).emit('roomUpdate', updatedRoom);
-        io.to(roomCode).emit('gameStarted', initialGameState);
-      } catch (error) {
-        console.error('Error in startGame handler:', error);
+        // Check if player exists in the room and update connection status
+        connectToDatabase().then(async () => {
+          try {
+            const room = await Room.findOne({ code: roomCodeStr });
+            if (room) {
+              const existingPlayer = room.players.find((p: Player) => p.id === playerIdStr);
+              
+              if (existingPlayer) {
+                console.log(`Player ${nicknameStr} found in room ${roomCodeStr}, updating connection status`);
+                
+                // Even if already connected, we update to ensure proper status
+                await Room.updateOne(
+                  { code: roomCodeStr, 'players.id': playerIdStr },
+                  { $set: { 'players.$.isConnected': true } }
+                );
+                
+                // Send immediate confirmation to this player
+                socket.emit('connectionStatus', { 
+                  status: 'connected',
+                  socketId: socket.id,
+                  playerId: playerIdStr,
+                  roomCode: roomCodeStr,
+                  isHost: existingPlayer.isHost,
+                  message: 'You are now connected to the room'
+                });
+                
+                // Add a small delay before sending room updates to ensure all clients are ready
+                setTimeout(async () => {
+                  // Get updated room with fresh query
+                  const updatedRoom = await Room.findOne({ code: roomCodeStr });
+                  if (updatedRoom) {
+                    // Broadcast to EVERYONE including the just-connected player
+                    console.log(`Broadcasting delayed room update for ${nicknameStr}'s connection`);
+                    io.to(roomCodeStr).emit('roomUpdate', formatRoomForClient(updatedRoom));
+                    
+                    // If the game is in progress, also send current game state to the reconnected player
+                    if (updatedRoom.gameState) {
+                      socket.emit('gameState', updatedRoom.gameState);
+                      
+                      if (updatedRoom.gameState.status === 'answering' && updatedRoom.gameState.timeRemaining) {
+                        socket.emit('timeUpdate', updatedRoom.gameState.timeRemaining);
+                      }
+                    }
+                    
+                    // Send ANOTHER room update after another brief delay to ensure changes propagate
+                    setTimeout(async () => {
+                      const finalRoom = await Room.findOne({ code: roomCodeStr });
+                      if (finalRoom) {
+                        console.log(`Broadcasting final room update confirmation for ${nicknameStr}`);
+                        io.to(roomCodeStr).emit('roomUpdate', formatRoomForClient(finalRoom));
+                      }
+                    }, 1000);
+                  }
+                }, 500);
+              } else {
+                console.log(`Player ${nicknameStr} not found in room ${roomCodeStr}, they may need to join first`);
+                socket.emit('error', 'You are not in this room. Please join first.');
+              }
+            } else {
+              console.log(`Room ${roomCodeStr} not found during socket connection`);
+              socket.emit('error', 'Room not found');
+            }
+          } catch (error) {
+            console.error('Error updating player connection status:', error);
+            socket.emit('error', 'Server error when updating connection');
+          }
+        });
+      } else {
+        console.log('Incomplete socket connection parameters:', { playerId, roomCode, nickname });
+        socket.emit('error', 'Incomplete connection info');
       }
-    });
-
-    /**
-     * Select category event handler
-     * When the player with the lowest score selects a category
-     */
-    socket.on('selectCategory', async (category: GameCategory) => {
-      console.log(`Category selected: ${category}`);
       
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
-        }
-
-        const { roomCode, playerId } = playerInfo;
-        
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          return;
-        }
-
-        // Verify game is in category selection state
-        if (!room.gameState || room.gameState.status !== 'category-selection') {
-          console.log('Game is not in category selection state');
-          return;
-        }
-
-        // Verify the player is the category selector
-        if (room.gameState.categorySelector !== playerId) {
-          console.log('Only the category selector can select a category');
-          return;
-        }
-
-        // Generate a question using the AI service
-        const { question, context } = await AIService.generateQuestion(category);
-        
-        // Update game state to question display
-        const updatedGameState: Partial<GameState> = {
-          status: 'question-display',
-          currentCategory: category,
-          question,
-          questionContext: context,
-          judgingStyle: AIService.getRandomJudgingStyle(),
-          timeRemaining: 180, // 3 minutes (180 seconds) to answer
-          answers: {}
-        };
-
-        // Update the room with the new game state
-        const updatedRoom = await Room.findOneAndUpdate(
-          { code: roomCode },
-          { 
-            $set: { 
-              'gameState.status': updatedGameState.status,
-              'gameState.currentCategory': updatedGameState.currentCategory,
-              'gameState.question': updatedGameState.question,
-              'gameState.questionContext': updatedGameState.questionContext,
-              'gameState.judgingStyle': updatedGameState.judgingStyle,
-              'gameState.timeRemaining': updatedGameState.timeRemaining,
-              'gameState.answers': {}
-            } 
-          },
-          { new: true }
-        );
-
-        if (!updatedRoom) {
-          console.log('Failed to update game state');
-          return;
-        }
-
-        console.log(`Question generated for room ${roomCode}: ${question}`);
-        
-        // Notify all players of the new question
-        io.to(roomCode).emit('roomUpdate', updatedRoom);
-        io.to(roomCode).emit('questionReady', updatedRoom.gameState);
-        
-        // Start a timer to transition to answering state
-        setTimeout(async () => {
-          const currentRoom = await Room.findOne({ code: roomCode });
-          if (currentRoom && currentRoom.gameState && currentRoom.gameState.status === 'question-display') {
+      /**
+       * Handle player reconnection event
+       * When a player refreshes the page, they first reconnect then join
+       */
+      socket.on('playerReconnected', async (data: { roomCode: string, playerId: string, nickname: string }) => {
+        try {
+          console.log(`Player ${data.nickname} (${data.playerId}) reconnecting to room ${data.roomCode}`);
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Check if room exists
+          const room = await Room.findOne({ code: data.roomCode });
+          if (!room) {
+            console.log(`Room ${data.roomCode} not found during reconnection`);
+            socket.emit('error', { message: 'Room not found' });
+            return;
+          }
+          
+          // Check if player exists in room and just mark as connected
+          const player = room.players.find((p: Player) => p.id === data.playerId);
+          if (player) {
+            console.log(`Found existing player ${data.playerId} in room ${data.roomCode}, marking as connected`);
+            
+            // Update player to connected status
             await Room.updateOne(
-              { code: roomCode },
-              { $set: { 'gameState.status': 'answering' } }
+              { code: data.roomCode, 'players.id': data.playerId },
+              { $set: { 'players.$.isConnected': true } }
             );
             
-            const updatedRoom = await Room.findOne({ code: roomCode });
-            io.to(roomCode).emit('roomUpdate', updatedRoom);
-            io.to(roomCode).emit('answeringStarted');
+            // Update socket to player mapping
+            socketToPlayer.set(socket.id, {
+              playerId: data.playerId,
+              roomCode: data.roomCode,
+              nickname: data.nickname
+            });
             
-            // Start the answer timer (180 seconds)
-            startAnswerTimer(roomCode, 180);
+            // Join the socket room
+            socket.join(data.roomCode);
+            
+            // If room was pending deletion, cancel it
+            cancelRoomDeletion(data.roomCode);
+            
+            // Get the updated room and broadcast to all clients
+            invalidateRoomCache(data.roomCode);
+            const updatedRoom = await getRoomWithCache(data.roomCode, true);
+            await broadcastRoomUpdate(data.roomCode, updatedRoom);
+            
+            // Confirm reconnection to client
+            socket.emit('roomJoined', {
+              roomCode: data.roomCode,
+              playerId: data.playerId,
+              isHost: player.isHost,
+              message: 'Reconnected successfully'
+            });
+            
+            // Log connected sockets in room
+            logSocketsInRoom(data.roomCode);
+          } else {
+            console.log(`Player ${data.playerId} not found in room ${data.roomCode} during reconnection`);
           }
-        }, 10000); // 10 seconds to read the question
-        
-      } catch (error) {
-        console.error('Error in selectCategory handler:', error);
-      }
-    });
-
-    /**
-     * Submit answer event handler
-     * When a player submits their answer to the current question
-     */
-    socket.on('submitAnswer', async (answer: string) => {
-      console.log(`Answer submitted`);
-      
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
+        } catch (error) {
+          console.error('Error handling playerReconnected:', error);
+          socket.emit('error', { message: 'Failed to reconnect to room' });
         }
+      });
 
-        const { roomCode, playerId } = playerInfo;
-        
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          return;
-        }
-
-        // Verify game is in answering state
-        if (!room.gameState || room.gameState.status !== 'answering') {
-          console.log('Game is not in answering state');
-          return;
-        }
-
-        // Prepare the update operation using dot notation for the specific player's answer
-        const updateOperation: Record<string, string> = {};
-        updateOperation[`gameState.answers.${playerId}`] = answer;
-
-        // Record the player's answer
-        const updatedRoom = await Room.findOneAndUpdate(
-          { code: roomCode },
-          { $set: updateOperation },
-          { new: true }
-        );
-
-        if (!updatedRoom) {
-          console.log('Failed to record answer');
-          return;
-        }
-
-        // Notify the player that their answer was recorded
-        socket.emit('answerRecorded', playerId);
-        
-        // Notify all players of how many answers have been submitted
-        const totalAnswers = Object.keys(updatedRoom.gameState.answers || {}).length;
-        io.to(roomCode).emit('answerCountUpdate', {
-          count: totalAnswers,
-          total: updatedRoom.players.length
-        });
-        
-        // Check if all players have answered
-        if (totalAnswers === updatedRoom.players.length) {
-          // Move to judging state immediately
-          await judgeAnswers(roomCode);
-        }
-        
-      } catch (error) {
-        console.error('Error in submitAnswer handler:', error);
-      }
-    });
-
-    /**
-     * Next round event handler
-     * When the host advances to the next round
-     */
-    socket.on('nextRound', async () => {
-      console.log('Next round event received');
-      
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
-        }
-
-        const { roomCode, playerId } = playerInfo;
-        
-        // Ensure database connection
-        await connectToDatabase();
-        
-        // Find the room
-        const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
-          return;
-        }
-
-        // Verify the player is the host
-        const hostPlayer = room.players.find((p: Player) => p.id === playerId);
-        if (!hostPlayer || !hostPlayer.isHost) {
-          console.log('Only the host can advance to the next round');
-          return;
-        }
-
-        // Verify game is in results state
-        if (!room.gameState || room.gameState.status !== 'results') {
-          console.log('Game is not in results state');
-          return;
-        }
-
-        // Check if this was the last round
-        const currentRound = room.gameState.round || 1;
-        const totalRounds = room.gameState.totalRounds || 5;
-        
-        if (currentRound >= totalRounds) {
-          // Game is over
-          const finalGameState = {
-            ...room.gameState,
-            status: 'game-over'
+      /**
+       * Handle join room event
+       * Adds players to rooms when they join
+       */
+      socket.on('joinRoom', async (data: { roomCode: string, nickname: string, playerId?: string }) => {
+        try {
+          console.log(`Socket ${socket.id} attempting to join room ${data.roomCode}`);
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Check if room exists
+          const room = await Room.findOne({ code: data.roomCode });
+          if (!room) {
+            console.log(`Room ${data.roomCode} not found`);
+            socket.emit('error', { message: 'Room not found' });
+            return;
+          }
+          
+          // Handle reconnection with existing player ID
+          if (data.playerId) {
+            const existingPlayer = room.players.find((p: Player) => p.id === data.playerId);
+            if (existingPlayer) {
+              console.log(`Player ${data.playerId} already exists in room, handling as reconnection`);
+              
+              // Update player's connection status if they were disconnected
+              if (!existingPlayer.isConnected) {
+                await Room.updateOne(
+                  { code: data.roomCode, 'players.id': data.playerId },
+                  { $set: { 'players.$.isConnected': true } }
+                );
+              }
+              
+              // Update socket to player mapping
+              socketToPlayer.set(socket.id, {
+                playerId: data.playerId,
+                roomCode: data.roomCode,
+                nickname: data.nickname
+              });
+              
+              // Join the socket room
+              socket.join(data.roomCode);
+              
+              // If room was pending deletion, cancel it
+              cancelRoomDeletion(data.roomCode);
+              
+              // Get the updated room and broadcast to all clients
+              invalidateRoomCache(data.roomCode);
+              const updatedRoom = await getRoomWithCache(data.roomCode, true);
+              await broadcastRoomUpdate(data.roomCode, updatedRoom);
+              
+              // Confirm reconnection to client
+              socket.emit('roomJoined', {
+                roomCode: data.roomCode,
+                playerId: data.playerId,
+                isHost: existingPlayer.isHost,
+                message: 'Rejoined room successfully'
+              });
+              
+              console.log(`Player ${data.nickname} (${data.playerId}) successfully reconnected to room ${data.roomCode}`);
+              logSocketsInRoom(data.roomCode);
+              return;
+            } else {
+              console.log(`Player ID ${data.playerId} provided but not found in room, will create new player`);
+            }
+          }
+          
+          // New player joining - create player ID
+          const playerId = data.playerId || uuidv4();
+          
+          // Check if room is full (maximum 8 players)
+          if (room.players.length >= 8) {
+            console.log(`Room ${data.roomCode} is full`);
+            socket.emit('error', { message: 'Room is full' });
+            return;
+          }
+          
+          // Check if nickname already exists in room
+          if (room.players.some((p: Player) => p.nickname === data.nickname)) {
+            console.log(`Nickname ${data.nickname} already exists in room ${data.roomCode}`);
+            socket.emit('error', { message: 'Nickname already exists in room' });
+            return;
+          }
+          
+          // Add player to room
+          const isHost = room.players.length === 0;
+          const player = {
+            id: playerId,
+            nickname: data.nickname,
+            isHost,
+            isConnected: true,
+            joinedAt: new Date()
           };
           
-          // Update the room with the final game state
+          // Update database
+          await Room.updateOne(
+            { code: data.roomCode },
+            { $push: { players: player } }
+          );
+          
+          // Update socket to player mapping
+          socketToPlayer.set(socket.id, {
+            playerId,
+            roomCode: data.roomCode,
+            nickname: data.nickname
+          });
+          
+          // Join the socket room
+          socket.join(data.roomCode);
+          
+          // If room was pending deletion, cancel it
+          cancelRoomDeletion(data.roomCode);
+          
+          // Get the updated room and broadcast to all clients
+          invalidateRoomCache(data.roomCode);
+          const updatedRoom = await getRoomWithCache(data.roomCode, true);
+          await broadcastRoomUpdate(data.roomCode, updatedRoom);
+          
+          // Confirm join to client
+          socket.emit('roomJoined', {
+            roomCode: data.roomCode,
+            playerId,
+            isHost,
+            message: 'Joined room successfully'
+          });
+          
+          console.log(`Player ${data.nickname} (${playerId}) successfully joined room ${data.roomCode} as ${isHost ? 'host' : 'player'}`);
+          logSocketsInRoom(data.roomCode);
+        } catch (error) {
+          console.error('Error joining room:', error);
+          socket.emit('error', { message: 'Failed to join room' });
+        }
+      });
+
+      /**
+       * Leave room event handler
+       * Removes a player from a room, reassigns host if needed, and broadcasts the update
+       */
+      socket.on('leaveRoom', async (roomCode: string) => {
+        console.log(`Leave room event: ${roomCode}, Socket: ${socket.id}`);
+        
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            socket.emit('error', 'Not connected to a room');
+            return;
+          }
+
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room with fresh data to verify the player exists
+          const room = await getRoomWithCache(roomCode, true); // Force fresh data
+          if (!room) {
+            console.log('Room not found:', roomCode);
+            socket.emit('error', 'Room not found');
+            return;
+          }
+
+          // Find the leaving player
+          const leavingPlayer = room.players.find((p: Player) => p.id === playerInfo.playerId);
+          if (!leavingPlayer) {
+            console.log('Player not found in room');
+            socket.emit('error', 'You are not in this room');
+            return;
+          }
+
+          console.log(`${leavingPlayer.nickname} is leaving room ${roomCode}`);
+          const wasHost = leavingPlayer.isHost;
+          const leavingPlayerNickname = leavingPlayer.nickname;
+
+          // CRITICAL FIX: Use findOneAndUpdate for atomic removal operation
+          const updatedRoomDoc = await Room.findOneAndUpdate(
+            { code: roomCode },
+            { $pull: { players: { id: playerInfo.playerId } } },
+            { new: true } // Return the updated document
+          );
+
+          if (!updatedRoomDoc) {
+            console.log('Failed to update room when player left');
+            socket.emit('error', 'Failed to leave room, please try again');
+            return;
+          }
+
+          // Verify player was removed
+          const playerStillExists = updatedRoomDoc.players.some((p: Player) => p.id === playerInfo.playerId);
+
+          if (playerStillExists) {
+            console.error(`Failed to remove player ${playerInfo.playerId} from room ${roomCode}`);
+            console.log('Current players in room:', updatedRoomDoc.players);
+            socket.emit('error', 'Failed to leave room, please try again');
+            return;
+          }
+
+          console.log(`Successfully removed player ${leavingPlayerNickname} from database. Remaining players: ${updatedRoomDoc.players.length}`);
+
+          // Invalidate the room cache
+          invalidateRoomCache(roomCode);
+
+          // If the leaving player was the host and there are other players, assign a new host
+          if (wasHost && updatedRoomDoc.players.length > 0) {
+            console.log(`Previous host left, transferring host status to next player in line`);
+            await transferHostStatus(roomCode);
+            
+            // Get the latest room data after host transfer and invalidate cache
+            invalidateRoomCache(roomCode);
+            const roomAfterHostTransfer = await getRoomWithCache(roomCode, true);
+            if (roomAfterHostTransfer) {
+              // Use the updated room for subsequent operations
+              Object.assign(updatedRoomDoc, roomAfterHostTransfer);
+            }
+          }
+
+          if (updatedRoomDoc.players.length === 0) {
+            // Instead of deleting the room immediately, schedule it for deletion
+            console.log(`Room ${roomCode} is now empty, scheduling for deletion`);
+            scheduleRoomDeletion(roomCode);
+          } else {
+            // Notify remaining players
+            await broadcastRoomUpdate(roomCode, updatedRoomDoc);
+            console.log(`Room update sent to ${updatedRoomDoc.players.length} remaining players after ${leavingPlayerNickname} left`);
+            logSocketsInRoom(roomCode);
+          }
+          
+          // Clean up socket connection
+          socketToPlayer.delete(socket.id);
+          socket.leave(roomCode);
+          
+          // Notify client to clear storage for this room
+          socket.emit('clearRoomStorage', { roomCode });
+          
+          // Disconnect this socket with a small delay to ensure messages are sent
+          setTimeout(() => {
+            try {
+              if (socket.connected) {
+                socket.disconnect(true);
+              }
+            } catch (error) {
+              console.error('Error disconnecting socket:', error);
+            }
+          }, 100);
+        } catch (error) {
+          console.error('Error in leaveRoom handler:', error);
+          socket.emit('error', 'Server error when leaving room');
+          
+          // Even with error, try to clean up client resources
+          socket.emit('clearRoomStorage', { roomCode });
+        }
+      });
+
+      /**
+       * Start game event handler
+       * Initiates the game when the host clicks the Begin button
+       */
+      socket.on('startGame', async () => {
+        console.log('Start game event received');
+        
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            return;
+          }
+
+          const { roomCode, playerId } = playerInfo;
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room
+          const room = await Room.findOne({ code: roomCode });
+          if (!room) {
+            console.log('Room not found:', roomCode);
+            return;
+          }
+
+          // Verify the player is the host
+          const hostPlayer = room.players.find((p: Player) => p.id === playerId);
+          if (!hostPlayer || !hostPlayer.isHost) {
+            console.log('Only the host can start the game');
+            return;
+          }
+
+          if (room.players.length < 2) {
+            console.log('Need at least 2 players to start the game');
+            return;
+          }
+
+          // Initialize scores for all players
+          const initialScores: Record<string, number> = {};
+          room.players.forEach((player: Player) => {
+            initialScores[player.id] = 0;
+          });
+
+          // Get available categories
+          const allCategories: GameCategory[] = ['business', 'scenario', 'wouldYouRather', 'pleadForYourLife', 'escape'];
+          
+          // Find player with lowest score (for first round, randomly select)
+          const randomPlayerIndex = Math.floor(Math.random() * room.players.length);
+          const categorySelector = room.players[randomPlayerIndex].id;
+
+          // Initialize the game state
+          const initialGameState: GameState = {
+            status: 'category-selection',
+            round: 1,
+            totalRounds: 5,
+            scores: initialScores,
+            answers: {},
+            categorySelector,
+            categories: allCategories,
+            roundHistory: []
+          };
+
+          // Update room status to playing and set initial game state
           const updatedRoom = await Room.findOneAndUpdate(
             { code: roomCode },
             { 
               $set: { 
-                'gameState.status': 'game-over'
+                status: 'playing',
+                currentRound: 1,
+                gameState: initialGameState
+              } 
+            },
+            { new: true }
+          );
+
+          if (!updatedRoom) {
+            console.log('Failed to update room status');
+            return;
+          }
+
+          console.log(`Game started in room ${roomCode}, round 1`);
+          
+          // Notify all players that the game has started
+          broadcastRoomUpdate(roomCode, updatedRoom);
+          io.to(roomCode).emit('gameStarted', initialGameState);
+        } catch (error) {
+          console.error('Error in startGame handler:', error);
+        }
+      });
+
+      /**
+       * Select category event handler
+       * When the player with the lowest score selects a category
+       */
+      socket.on('selectCategory', async (category: GameCategory) => {
+        console.log(`Category selected: ${category}`);
+        
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            return;
+          }
+
+          const { roomCode, playerId } = playerInfo;
+          console.log(`Player ${playerId} selecting category ${category} for room ${roomCode}`);
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room
+          const room = await Room.findOne({ code: roomCode });
+          if (!room) {
+            console.log('Room not found:', roomCode);
+            return;
+          }
+
+          // Verify game is in category selection state
+          if (!room.gameState || room.gameState.status !== 'category-selection') {
+            console.log(`Game is not in category selection state. Current state: ${room.gameState?.status}`);
+            return;
+          }
+
+          // Verify the player is the category selector
+          if (room.gameState.categorySelector !== playerId) {
+            console.log(`Player ${playerId} is not the category selector. Selector is: ${room.gameState.categorySelector}`);
+            return;
+          }
+
+          console.log(`Generating question for category: ${category}`);
+          // Generate a question using the AI service
+          const { question, context } = await AIService.generateQuestion(category);
+          console.log(`Question generated: ${question}`);
+          
+          // Update game state to question display
+          const updatedGameState: Partial<GameState> = {
+            status: 'question-display',
+            currentCategory: category,
+            question,
+            questionContext: context,
+            judgingStyle: AIService.getRandomJudgingStyle(),
+            timeRemaining: 180, // 3 minutes (180 seconds) to answer
+            answers: {}
+          };
+
+          // Update the room with the new game state
+          const updatedRoom = await Room.findOneAndUpdate(
+            { code: roomCode },
+            { 
+              $set: { 
+                'gameState.status': updatedGameState.status,
+                'gameState.currentCategory': updatedGameState.currentCategory,
+                'gameState.question': updatedGameState.question,
+                'gameState.questionContext': updatedGameState.questionContext,
+                'gameState.judgingStyle': updatedGameState.judgingStyle,
+                'gameState.timeRemaining': updatedGameState.timeRemaining,
+                'gameState.answers': {}
               } 
             },
             { new: true }
@@ -663,386 +816,926 @@ app.prepare().then(() => {
             return;
           }
 
-          console.log(`Game over in room ${roomCode}`);
+          console.log(`Updated room game state to ${updatedRoom.gameState.status}`);
+          console.log(`Question for room ${roomCode}: ${question}`);
           
-          // Notify all players that the game is over
-          io.to(roomCode).emit('roomUpdate', updatedRoom);
-          io.to(roomCode).emit('gameOver', finalGameState);
+          // Notify all players of the new question
+          console.log(`Broadcasting roomUpdate and questionReady events to room ${roomCode}`);
+          broadcastRoomUpdate(roomCode, updatedRoom);
+          io.to(roomCode).emit('questionReady', updatedRoom.gameState);
           
-          return;
+          // Start a timer to transition to answering state
+          console.log(`Starting timer to transition to answering state (10s)`);
+          setTimeout(async () => {
+            try {
+              const currentRoom = await Room.findOne({ code: roomCode });
+              if (!currentRoom) {
+                console.log(`Room ${roomCode} not found when transitioning to answering`);
+                return;
+              }
+              
+              if (currentRoom.gameState && currentRoom.gameState.status === 'question-display') {
+                console.log(`Transitioning room ${roomCode} from question-display to answering`);
+                await Room.updateOne(
+                  { code: roomCode },
+                  { $set: { 'gameState.status': 'answering' } }
+                );
+                
+                const updatedRoom = await Room.findOne({ code: roomCode });
+                if (!updatedRoom) {
+                  console.log(`Failed to fetch updated room ${roomCode} after status change`);
+                  return;
+                }
+                
+                console.log(`Broadcasting roomUpdate and answeringStarted events to room ${roomCode}`);
+                broadcastRoomUpdate(roomCode, updatedRoom);
+                io.to(roomCode).emit('answeringStarted');
+                
+                // Start the answer timer (180 seconds)
+                console.log(`Starting answer timer for room ${roomCode} (180s)`);
+                startAnswerTimer(roomCode, 180);
+              } else {
+                console.log(`Room ${roomCode} is not in question-display state, cannot transition to answering. Current state: ${currentRoom.gameState?.status}`);
+              }
+            } catch (error) {
+              console.error(`Error transitioning to answering state: ${error}`);
+            }
+          }, 10000); // 10 seconds to read the question
+          
+        } catch (error) {
+          console.error('Error in selectCategory handler:', error);
         }
+      });
+
+      /**
+       * Submit answer event handler
+       * When a player submits their answer to the current question
+       */
+      socket.on('submitAnswer', async (answer: string) => {
+        // Get player info from socket mapping
+        const playerInfo = socketToPlayer.get(socket.id);
+        console.log(`Player ${playerInfo?.nickname || 'unknown'} submitted answer: ${answer}`);
         
-        // Start the next round
-        await startNextRound(roomCode, currentRound + 1);
+        try {
+          if (!playerInfo || !playerInfo.roomCode || !playerInfo.playerId) {
+            socket.emit('error', 'No room or player info found');
+            return;
+          }
+
+          if (!answer || answer.trim() === '') {
+            socket.emit('error', 'Answer cannot be empty');
+            return;
+          }
+
+          await connectToDatabase();
+          const room = await Room.findOne({ code: playerInfo.roomCode });
+          
+          if (!room) {
+            socket.emit('error', 'Room not found');
+            return;
+          }
+
+          if (room.gameState.status !== 'answering') {
+            socket.emit('error', 'Game is not in answering state');
+            return;
+          }
+
+          // Prepare answers as a Map
+          if (!room.gameState.answers) {
+            // Initialize answers map if it doesn't exist
+            room.gameState.answers = new Map<string, string>();
+          }
+
+          // Check if player has already submitted an answer
+          if (room.gameState.answers.has(playerInfo.playerId)) {
+            socket.emit('error', 'You have already submitted an answer');
+            return;
+          }
+
+          // Add answer to the map (key = playerId, value = answer text)
+          room.gameState.answers.set(playerInfo.playerId, answer);
+          
+          // Count connected players who have answered
+          const connectedPlayers = room.players.filter((p: Player) => p.isConnected);
+          const answers = Array.from(room.gameState.answers.keys());
+          
+          // Check if all connected players have answered
+          const allPlayersAnswered = connectedPlayers.every((player: Player) => 
+            answers.includes(player.id)
+          );
+
+          // If all players have answered, move to judging
+          if (allPlayersAnswered) {
+            console.log(`All players in room ${playerInfo.roomCode} have answered. Moving to judging phase.`);
+            room.gameState.timeRemaining = 0; // Force time to 0 to move to judging
+            room.gameState.status = 'judging';
+            
+            // Store answers in round history (convert answers map to object for storage)
+            if (!room.gameState.roundHistory[room.gameState.round - 1]) {
+              const answersObject: Record<string, string> = {};
+              room.gameState.answers.forEach((value: string, key: string) => {
+                answersObject[key] = value;
+              });
+              
+              room.gameState.roundHistory[room.gameState.round - 1] = {
+                question: room.gameState.question,
+                category: room.gameState.currentCategory,
+                answers: answersObject
+              };
+            }
+          }
+          
+          // Calculate how many players have answered for the progress indicator
+          const answerCount = {
+            count: room.gameState.answers.size,
+            total: connectedPlayers.length
+          };
+
+          await room.save();
+          
+          // Notify player their answer was recorded
+          socket.emit('answerRecorded', playerInfo.playerId);
+          
+          // Update all clients about answer progress
+          io.to(playerInfo.roomCode).emit('answerCountUpdate', answerCount);
+          
+          // Send full gameState when all have answered
+          if (allPlayersAnswered) {
+            io.to(playerInfo.roomCode).emit('gameState', room.gameState);
+            broadcastRoomUpdate(playerInfo.roomCode, room);
+          }
+        } catch (error) {
+          console.error('Error in submitAnswer:', error);
+          socket.emit('error', 'Failed to submit answer');
+        }
+      });
+
+      /**
+       * Next round event handler
+       * When the host advances to the next round
+       */
+      socket.on('nextRound', async () => {
+        console.log('Next round event received');
         
-      } catch (error) {
-        console.error('Error in nextRound handler:', error);
-      }
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            return;
+          }
+
+          const { roomCode, playerId } = playerInfo;
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room
+          const room = await Room.findOne({ code: roomCode });
+          if (!room) {
+            console.log('Room not found:', roomCode);
+            return;
+          }
+
+          // Verify the player is the host
+          const hostPlayer = room.players.find((p: Player) => p.id === playerId);
+          if (!hostPlayer || !hostPlayer.isHost) {
+            console.log('Only the host can advance to the next round');
+            return;
+          }
+
+          // Verify game is in results state
+          if (!room.gameState || room.gameState.status !== 'results') {
+            console.log('Game is not in results state');
+            return;
+          }
+
+          // Check if this was the last round
+          const currentRound = room.gameState.round || 1;
+          const totalRounds = room.gameState.totalRounds || 5;
+          
+          if (currentRound >= totalRounds) {
+            // Game is over
+            const finalGameState = {
+              ...room.gameState,
+              status: 'game-over'
+            };
+            
+            // Update the room with the final game state
+            const updatedRoom = await Room.findOneAndUpdate(
+              { code: roomCode },
+              { 
+                $set: { 
+                  'gameState.status': 'game-over'
+                } 
+              },
+              { new: true }
+            );
+
+            if (!updatedRoom) {
+              console.log('Failed to update game state');
+              return;
+            }
+
+            console.log(`Game over in room ${roomCode}`);
+            
+            // Notify all players that the game is over
+            broadcastRoomUpdate(roomCode, updatedRoom);
+            io.to(roomCode).emit('gameOver', finalGameState);
+            
+            return;
+          }
+          
+          // Start the next round
+          await startNextRound(roomCode, currentRound + 1);
+          
+        } catch (error) {
+          console.error('Error in nextRound handler:', error);
+        }
+      });
+
+      /**
+       * Kick player event handler
+       * Allows the host to remove a player from the room
+       */
+      socket.on('kickPlayer', async (playerIdToKick: string) => {
+        console.log(`Kick player event received for player: ${playerIdToKick}`);
+        
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            socket.emit('error', 'Not connected to a room');
+            return;
+          }
+
+          const { roomCode, playerId } = playerInfo;
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room with fresh data
+          const room = await getRoomWithCache(roomCode, true); // Force fresh data
+          if (!room) {
+            console.log('Room not found:', roomCode);
+            socket.emit('error', 'Room not found');
+            return;
+          }
+
+          // Verify the requester is the host
+          const hostPlayer = room.players.find((p: Player) => p.id === playerId);
+          if (!hostPlayer || !hostPlayer.isHost) {
+            console.log('Only the host can kick players');
+            socket.emit('error', 'Only the host can remove players');
+            return;
+          }
+
+          // Find the player to kick
+          const playerToKick = room.players.find((p: Player) => p.id === playerIdToKick);
+          if (!playerToKick) {
+            console.log('Player to kick not found');
+            socket.emit('error', 'Player not found or already left the room');
+            return;
+          }
+
+          if (playerToKick.isHost) {
+            console.log('Cannot kick the host');
+            socket.emit('error', 'Cannot remove the host from the room');
+            return;
+          }
+
+          // Capture player name for logging
+          const playerNickname = playerToKick.nickname;
+          console.log(`Kicking player ${playerNickname} (${playerIdToKick}) from room ${roomCode}`);
+
+          // CRITICAL FIX: Use findOneAndUpdate to atomically remove the player
+          // This is more reliable than the previous update operation
+          const updatedRoomDoc = await Room.findOneAndUpdate(
+            { code: roomCode },
+            { $pull: { players: { id: playerIdToKick } } },
+            { new: true } // Return the updated document
+          );
+          
+          if (!updatedRoomDoc) {
+            console.log('Failed to update room when kicking player');
+            socket.emit('error', 'Failed to remove player from room');
+            return;
+          }
+          
+          // Double-check player was actually removed
+          const playerStillExists = updatedRoomDoc.players.some((p: Player) => p.id === playerIdToKick);
+          if (playerStillExists) {
+            console.error(`Failed to remove player ${playerIdToKick} from room ${roomCode}`);
+            console.log('Current players in room:', updatedRoomDoc.players);
+            socket.emit('error', 'Failed to remove player, please try again');
+            return;
+          }
+          
+          console.log(`Successfully removed player ${playerNickname} from database. Remaining players: ${updatedRoomDoc.players.length}`);
+
+          // Find all sockets for the kicked player
+          console.log(`Looking for all socket connections for player ${playerIdToKick}`);
+          let kickedPlayerSocketIds: string[] = [];
+
+          for (const [socketId, info] of socketToPlayer.entries()) {
+            if (info.playerId === playerIdToKick) {
+              kickedPlayerSocketIds.push(socketId);
+            }
+          }
+
+          console.log(`Found ${kickedPlayerSocketIds.length} socket(s) for the kicked player`);
+
+          // Notify and disconnect all sockets for the kicked player
+          for (const kickedSocketId of kickedPlayerSocketIds) {
+            const kickedSocket = io.sockets.sockets.get(kickedSocketId);
+            if (kickedSocket) {
+              console.log(`Processing kick for socket ${kickedSocketId}`);
+              
+              // Completely disable reconnection before sending any events
+              // This must be the FIRST thing we send to ensure it's processed before disconnect
+              kickedSocket.emit('forceDisconnect', {
+                message: 'You have been kicked from the room',
+                roomCode: roomCode
+              });
+              
+              // Send additional events for backward compatibility
+              kickedSocket.emit('clearRoomStorage', { roomCode });
+              kickedSocket.emit('kicked', 'You have been kicked from the room');
+              
+              // Clean up socket mapping
+              socketToPlayer.delete(kickedSocketId);
+              kickedSocket.leave(roomCode);
+              
+              // Force disconnect - important: we're forcing a server disconnect which
+              // the client should NOT attempt to auto-reconnect from
+              try {
+                console.log(`Disconnecting kicked socket ${kickedSocketId}`);
+                kickedSocket.disconnect(true);  // true = server disconnect
+              } catch (err) {
+                console.error(`Error disconnecting socket ${kickedSocketId}:`, err);
+              }
+            }
+          }
+
+          // Invalidate cache after updating the room
+          invalidateRoomCache(roomCode);
+          
+          // Notify remaining players with formatted room data
+          await broadcastRoomUpdate(roomCode, updatedRoomDoc);
+          console.log(`Room update sent after player ${playerNickname} kicked. Remaining players: ${updatedRoomDoc.players.length}`);
+          
+          // Log all sockets in the room to verify updates are going to the right places
+          logSocketsInRoom(roomCode);
+        } catch (error) {
+          console.error('Error in kickPlayer handler:', error);
+          socket.emit('error', 'Server error when removing player');
+        }
+      });
+
+      /**
+       * Socket disconnect handler
+       * Removes players from the room when they disconnect
+       */
+      socket.on('disconnect', async () => {
+        console.log(`Socket disconnected: ${socket.id}`);
+        const playerInfo = socketToPlayer.get(socket.id);
+        
+        if (playerInfo) {
+          console.log(`Player disconnected: ${playerInfo.nickname} (${playerInfo.playerId}) from room ${playerInfo.roomCode}`);
+          
+          try {
+            // Ensure database connection
+            await connectToDatabase();
+            
+            // Force a fresh room fetch to get the latest state
+            const room = await getRoomWithCache(playerInfo.roomCode, true);
+            if (!room) {
+              console.log(`Room ${playerInfo.roomCode} not found during disconnect`);
+              socketToPlayer.delete(socket.id);
+              return;
+            }
+            
+            // Check if the player is in the room
+            const leavingPlayer = room.players.find((p: Player) => p.id === playerInfo.playerId);
+            if (!leavingPlayer) {
+              console.log(`Player ${playerInfo.playerId} already removed from room ${playerInfo.roomCode}`);
+              socketToPlayer.delete(socket.id);
+              return;
+            }
+            
+            const wasHost = leavingPlayer.isHost;
+            const playerNickname = leavingPlayer.nickname;
+            
+            // IMPORTANT FIX: For quick page refreshes, mark as disconnected first 
+            // instead of immediate removal
+            console.log(`Marking player ${playerNickname} as disconnected (delaying removal)`);
+            await Room.updateOne(
+              { code: playerInfo.roomCode, 'players.id': playerInfo.playerId },
+              { $set: { 'players.$.isConnected': false } }
+            );
+            
+            // Update other clients
+            const updatedRoom = await Room.findOne({ code: playerInfo.roomCode });
+            if (updatedRoom) {
+              await broadcastRoomUpdate(playerInfo.roomCode, updatedRoom);
+            }
+            
+            // Remove socket from tracking
+            socketToPlayer.delete(socket.id);
+            socket.leave(playerInfo.roomCode);
+            
+            // Remove player immediately without waiting
+            console.log(`Immediately removing player ${playerNickname} (no reconnection grace period)`);
+
+            // Use findOneAndUpdate for atomic operation (same as in kickPlayer)
+            try {
+              const updatedRoomDoc = await Room.findOneAndUpdate(
+                { code: playerInfo.roomCode },
+                { $pull: { players: { id: playerInfo.playerId } } },
+                { new: true }
+              );
+              
+              if (!updatedRoomDoc) {
+                console.log(`Failed to update room ${playerInfo.roomCode} during immediate disconnect`);
+                return;
+              }
+              
+              console.log(`Successfully removed player ${playerNickname} from database. Remaining players: ${updatedRoomDoc.players.length}`);
+              
+              // Invalidate the room cache
+              invalidateRoomCache(playerInfo.roomCode);
+                
+              // If the leaving player was the host and there are other players, assign a new host
+              if (wasHost && updatedRoomDoc.players.length > 0) {
+                console.log(`Previous host disconnected, transferring host status to next player in line`);
+                await transferHostStatus(playerInfo.roomCode);
+                
+                // Get the latest room data after host transfer
+                invalidateRoomCache(playerInfo.roomCode);
+                const roomAfterHostTransfer = await getRoomWithCache(playerInfo.roomCode, true);
+                if (roomAfterHostTransfer) {
+                  // Use the updated room for subsequent operations
+                  Object.assign(updatedRoomDoc, roomAfterHostTransfer);
+                }
+              }
+                
+              if (updatedRoomDoc.players.length === 0) {
+                // Schedule room for deletion instead of deleting immediately
+                console.log(`Room ${playerInfo.roomCode} is now empty, scheduling for deletion`);
+                scheduleRoomDeletion(playerInfo.roomCode);
+              } else {
+                // Notify remaining players about the updated room state
+                await broadcastRoomUpdate(playerInfo.roomCode, updatedRoomDoc);
+                console.log(`Room update sent to ${updatedRoomDoc.players.length} remaining players after ${playerNickname} disconnected`);
+                logSocketsInRoom(playerInfo.roomCode);
+              }
+            } catch (error) {
+              console.error('Error handling immediate disconnect removal:', error);
+            }
+          } catch (error) {
+            console.error('Error handling disconnect:', error);
+            socketToPlayer.delete(socket.id);
+          }
+        }
+      });
     });
 
     /**
-     * Kick player event handler
-     * Allows the host to remove a player from the room
+     * Helper functions for game logic
      */
-    socket.on('kickPlayer', async (playerIdToKick: string) => {
-      console.log(`Kick player event received for player: ${playerIdToKick}`);
-      
-      try {
-        // Get player info from socket mapping
-        const playerInfo = socketToPlayer.get(socket.id);
-        if (!playerInfo) {
-          console.log('No player info found for socket');
-          return;
-        }
 
-        const { roomCode, playerId } = playerInfo;
+    /**
+     * Start the answer timer
+     */
+    const startAnswerTimer = async (roomCode: string, duration: number) => {
+      try {
+        // Initialize timer in room
+        const room = await Room.findOne({ code: roomCode });
+        if (!room || !room.gameState) return;
         
-        // Ensure database connection
-        await connectToDatabase();
+        room.gameState.timeRemaining = duration;
+        await room.save();
+        io.to(roomCode).emit('timeUpdate', duration);
+        
+        // Start countdown
+        const timer = setInterval(async () => {
+          try {
+            // Fetch the latest room state to ensure we have updated data
+            const currentRoom = await Room.findOne({ code: roomCode });
+            if (!currentRoom || !currentRoom.gameState) {
+              clearInterval(timer);
+              return;
+            }
+            
+            // If the game is no longer in answering state, stop the timer
+            if (currentRoom.gameState.status !== 'answering') {
+              clearInterval(timer);
+              return;
+            }
+            
+            // Decrement time
+            let timeRemaining = currentRoom.gameState.timeRemaining - 1;
+            
+            // Handle timer completion
+            if (timeRemaining <= 0) {
+              clearInterval(timer);
+              timeRemaining = 0;
+              console.log(`Timer reached zero for room ${roomCode}. Transitioning to results.`);
+              
+              // Save the time and emit the update
+              currentRoom.gameState.timeRemaining = timeRemaining;
+              await currentRoom.save();
+              io.to(roomCode).emit('timeUpdate', timeRemaining);
+              
+              // Automatically move to results when time is up
+              await judgeAnswers(roomCode);
+              return;
+            }
+            
+            // Update the room with new time
+            currentRoom.gameState.timeRemaining = timeRemaining;
+            await currentRoom.save();
+            
+            // Emit time update every second
+            io.to(roomCode).emit('timeUpdate', timeRemaining);
+          } catch (error) {
+            console.error('Error updating timer:', error);
+            clearInterval(timer);
+          }
+        }, 1000);
+      } catch (error) {
+        console.error('Error starting timer:', error);
+      }
+    };
+
+    /**
+     * Judge the answers and update scores
+     */
+    async function judgeAnswers(roomCode: string) {
+      try {
+        console.log(`[judgeAnswers] Starting judging process for room ${roomCode}`);
         
         // Find the room
         const room = await Room.findOne({ code: roomCode });
-        if (!room) {
-          console.log('Room not found:', roomCode);
+        if (!room || !room.gameState) {
+          console.log('[judgeAnswers] Room not found or game state missing');
           return;
         }
-
-        // Verify the requester is the host
-        const hostPlayer = room.players.find((p: Player) => p.id === playerId);
-        if (!hostPlayer || !hostPlayer.isHost) {
-          console.log('Only the host can kick players');
-          return;
-        }
-
-        // Find the player to kick
-        const playerToKick = room.players.find((p: Player) => p.id === playerIdToKick);
-        if (!playerToKick) {
-          console.log('Player to kick not found');
-          return;
-        }
-
-        if (playerToKick.isHost) {
-          console.log('Cannot kick the host');
-          return;
-        }
-
-        console.log(`Kicking player ${playerToKick.nickname} from room ${roomCode}`);
-
-        // Remove the player from the room
-        const updatedRoom = await Room.findOneAndUpdate(
+        
+        console.log(`[judgeAnswers] Room found, current status: ${room.gameState.status}`);
+        
+        // Update status to judging
+        await Room.updateOne(
           { code: roomCode },
-          {
-            $pull: { players: { id: playerIdToKick } }
-          },
+          { $set: { 'gameState.status': 'judging' } }
+        );
+        
+        console.log(`[judgeAnswers] Updated room status to 'judging'`);
+        
+        const updatedRoom = await Room.findOne({ code: roomCode });
+        io.to(roomCode).emit('roomUpdate', updatedRoom);
+        io.to(roomCode).emit('judgingStarted');
+        
+        console.log(`[judgeAnswers] Notified all players that judging has started`);
+        
+        // Get the answers, category, and question
+        const gameState = updatedRoom.gameState;
+        const answers = gameState.answers || {};
+        const category = gameState.currentCategory as GameCategory;
+        const judgingStyle = gameState.judgingStyle as JudgingStyle;
+        const question = gameState.question || '';
+        
+        // Convert Mongoose Map to plain object if needed
+        let answersObj: Record<string, string> = {};
+        if (answers instanceof Map) {
+          // Convert standard Map to object
+          answersObj = Object.fromEntries(answers);
+        } else if (answers instanceof Object && typeof answers.toJSON === 'function') {
+          // Handle Mongoose Map/Document with toJSON method
+          const jsonObj = answers.toJSON();
+          for (const [key, value] of Object.entries(jsonObj)) {
+            if (!key.startsWith('$')) { // Skip Mongoose internal keys
+              answersObj[key] = value as string;
+            }
+          }
+        } else {
+          // It's already an object
+          answersObj = answers as Record<string, string>;
+        }
+        
+        console.log(`[judgeAnswers] Answers to judge:`, answersObj);
+        console.log(`[judgeAnswers] Category: ${category}, Style: ${judgingStyle}`);
+        console.log(`[judgeAnswers] Question: ${question}`);
+        
+        // Use AI to judge the answers
+        console.log(`[judgeAnswers] Sending request to AI service for judging...`);
+        const judgingResult = await AIService.judgeAnswers(
+          category,
+          judgingStyle,
+          question,
+          answersObj
+        );
+        
+        console.log(`[judgeAnswers] AI judgment received:`, judgingResult);
+        console.log(`[judgeAnswers] Winners:`, judgingResult.winners);
+        
+        // Award points to winners (3 points each)
+        const pointsPerWin = 3;
+        const updatedScores = { ...(gameState.scores || {}) };
+        
+        judgingResult.winners.forEach((playerId: string) => {
+          updatedScores[playerId] = (updatedScores[playerId] || 0) + pointsPerWin;
+          console.log(`[judgeAnswers] Awarded ${pointsPerWin} points to player ${playerId}`);
+        });
+        
+        // Save the round history
+        // Create a clean version of the answers object for storage
+        const cleanAnswers: Record<string, string> = {};
+        Object.keys(answersObj).forEach((key: string) => {
+          cleanAnswers[key] = answersObj[key];
+        });
+        
+        const roundHistory = [...(gameState.roundHistory || [])];
+        roundHistory.push({
+          round: gameState.round,
+          category,
+          question,
+          answers: cleanAnswers,
+          winners: judgingResult.winners,
+          explanation: judgingResult.explanation
+        });
+        
+        console.log(`[judgeAnswers] Added round to history. Total rounds in history: ${roundHistory.length}`);
+        
+        // Update the game state with judging results and scores
+        console.log(`[judgeAnswers] Updating game state to 'results'`);
+        await Room.updateOne(
+          { code: roomCode },
+          { 
+            $set: { 
+              'gameState.status': 'results',
+              'gameState.judgingResult': judgingResult,
+              'gameState.scores': updatedScores,
+              'gameState.roundHistory': roundHistory
+            } 
+          }
+        );
+        
+        const finalUpdatedRoom = await Room.findOne({ code: roomCode });
+        console.log(`[judgeAnswers] Final room status: ${finalUpdatedRoom.gameState.status}`);
+        
+        console.log(`[judgeAnswers] Emitting final roomUpdate to all players`);
+        broadcastRoomUpdate(roomCode, finalUpdatedRoom);
+        
+        console.log(`[judgeAnswers] Emitting judgingComplete to all players`);
+        io.to(roomCode).emit('judgingComplete', {
+          judgingResult,
+          scores: updatedScores
+        });
+        
+        console.log(`[judgeAnswers] Judging process complete for room ${roomCode}`);
+        
+      } catch (error) {
+        console.error('Error judging answers:', error);
+      }
+    }
+
+    /**
+     * Helper function to transfer host status to the next connected player
+     */
+    async function transferHostStatus(roomCode: string) {
+      console.log(`Transferring host status in room ${roomCode}`);
+      try {
+        const room = await Room.findOne({ code: roomCode });
+        if (!room || room.players.length === 0) {
+          console.log('No players left to transfer host status to');
+          return false;
+        }
+
+        // Find the first connected player to make host
+        const nextHostIndex = room.players.findIndex((p: Player) => p.isConnected);
+        if (nextHostIndex === -1) {
+          console.log('No connected players found to transfer host status to');
+          return false;
+        }
+
+        console.log(`Transferring host status to player: ${room.players[nextHostIndex].nickname}`);
+        
+        // Update the new host in the database
+        const newHostRoom = await Room.findOneAndUpdate(
+          { code: roomCode },
+          { $set: { [`players.${nextHostIndex}.isHost`]: true } },
           { new: true }
         );
 
-        if (!updatedRoom) {
-          console.log('Failed to update room');
-          return;
+        if (newHostRoom) {
+          console.log(`New host assigned: ${newHostRoom.players[nextHostIndex].nickname}`);
+          
+          // Broadcast room update to all players
+          broadcastRoomUpdate(roomCode, newHostRoom);
+          
+          return true;
         }
+        return false;
+      } catch (error) {
+        console.error('Error transferring host status:', error);
+        return false;
+      }
+    }
 
-        // Find the socket for the kicked player
-        let kickedPlayerSocketId: string | undefined;
-        for (const [socketId, info] of socketToPlayer.entries()) {
-          if (info.playerId === playerIdToKick) {
-            kickedPlayerSocketId = socketId;
-            break;
-          }
-        }
-
-        // Notify the kicked player
-        if (kickedPlayerSocketId) {
-          const kickedSocket = io.sockets.sockets.get(kickedPlayerSocketId);
-          if (kickedSocket) {
-            // Send kicked event to the player being removed
-            kickedSocket.emit('kicked', 'You have been kicked from the room');
+    // Helper function to schedule room deletion after inactivity
+    function scheduleRoomDeletion(roomCode: string) {
+      // Clear any existing timeout for this room
+      if (pendingRoomDeletions.has(roomCode)) {
+        clearTimeout(pendingRoomDeletions.get(roomCode)!);
+        pendingRoomDeletions.delete(roomCode);
+      }
+      
+      console.log(`Scheduling room ${roomCode} for deletion in ${ROOM_DELETION_DELAY/1000/60} minutes due to inactivity`);
+      
+      // Notify any remaining socket connections about room inactivity
+      // This helps clients know the room is temporarily inactive but will persist
+      io.to(roomCode).emit('roomInactive', {
+        message: 'Room is temporarily inactive. It will be available for the next 5 minutes if anyone wants to rejoin.',
+        roomCode: roomCode
+      });
+      
+      // Set a new timeout
+      const timeoutId = setTimeout(async () => {
+        try {
+          console.log(`Deleting inactive room ${roomCode} after timeout`);
+          
+          // Double-check the room is still empty before deleting
+          const room = await Room.findOne({ code: roomCode });
+          if (room && room.players.length === 0) {
+            await Room.deleteOne({ code: roomCode });
+            console.log(`Room ${roomCode} deleted after inactivity timeout`);
             
-            // Clean up socket mapping and disconnect
-            socketToPlayer.delete(kickedPlayerSocketId);
-            kickedSocket.leave(roomCode);
-            kickedSocket.disconnect();
+            // Send final room ended notification
+            io.to(roomCode).emit('roomEnded', 'Room has been closed due to inactivity');
+          } else if (room) {
+            console.log(`Room ${roomCode} has players again, cancelling deletion`);
+          } else {
+            console.log(`Room ${roomCode} already deleted`);
           }
+          
+          // Clean up the pending deletion
+          pendingRoomDeletions.delete(roomCode);
+          
+        } catch (error) {
+          console.error(`Error deleting inactive room ${roomCode}:`, error);
         }
+      }, ROOM_DELETION_DELAY);
+      
+      // Store the timeout ID
+      pendingRoomDeletions.set(roomCode, timeoutId);
+    }
 
-        // Notify remaining players
-        io.to(roomCode).emit('roomUpdate', updatedRoom);
-        console.log(`Room update sent after player kicked. Remaining players: ${updatedRoom.players.length}`);
-      } catch (error) {
-        console.error('Error in kickPlayer handler:', error);
+    // Helper function to cancel room deletion if players rejoin
+    function cancelRoomDeletion(roomCode: string) {
+      if (pendingRoomDeletions.has(roomCode)) {
+        console.log(`Cancelling scheduled deletion for room ${roomCode}`);
+        clearTimeout(pendingRoomDeletions.get(roomCode)!);
+        pendingRoomDeletions.delete(roomCode);
       }
-    });
+    }
 
-    /**
-     * Socket disconnect handler
-     * Cleans up player info when a socket disconnects
-     */
-    socket.on('disconnect', () => {
-      console.log(`Socket disconnected: ${socket.id}`);
-      const playerInfo = socketToPlayer.get(socket.id);
-      if (playerInfo) {
-        console.log(`Cleaning up player: ${playerInfo.nickname}`);
-        socketToPlayer.delete(socket.id);
-      }
-    });
-  });
-
-  // Start the server
-  server.listen(3000, () => {
-    console.log('> Ready on http://localhost:3000');
-  });
-});
-
-/**
- * Helper functions for game logic
- */
-
-/**
- * Start the answer timer
- */
-const startAnswerTimer = async (roomCode: string, duration: number) => {
-  try {
-    // Initialize timer in room
-    const room = await Room.findOne({ code: roomCode });
-    if (!room || !room.gameState) return;
-    
-    room.gameState.timeRemaining = duration;
-    await room.save();
-    io.to(roomCode).emit('timeUpdate', duration);
-    
-    // Start countdown
-    const timer = setInterval(async () => {
+    // Helper function to start the next round
+    async function startNextRound(roomCode: string, roundNumber: number) {
       try {
-        // Fetch the latest room state to ensure we have updated data
-        const currentRoom = await Room.findOne({ code: roomCode });
-        if (!currentRoom || !currentRoom.gameState) {
-          clearInterval(timer);
+        // Find the room
+        const room = await Room.findOne({ code: roomCode });
+        if (!room || !room.gameState) {
+          console.log('Room not found or game state missing');
           return;
         }
         
-        // If the game is no longer in answering state, stop the timer
-        if (currentRoom.gameState.status !== 'answering') {
-          clearInterval(timer);
+        // Find player with lowest score to select the next category
+        const scores = room.gameState.scores || {};
+        let lowestScore = Infinity;
+        let lowestScorePlayer = '';
+        
+        Object.entries(scores).forEach(([playerId, score]) => {
+          const numericScore = Number(score);
+          if (numericScore < lowestScore) {
+            lowestScore = numericScore;
+            lowestScorePlayer = playerId;
+          }
+        });
+        
+        // If somehow there's no lowest (all equal), pick a random player
+        if (!lowestScorePlayer && room.players.length > 0) {
+          const randomIndex = Math.floor(Math.random() * room.players.length);
+          lowestScorePlayer = room.players[randomIndex].id;
+        }
+        
+        // Get available categories
+        const allCategories: GameCategory[] = ['business', 'scenario', 'wouldYouRather', 'pleadForYourLife', 'escape'];
+        const usedCategories = room.gameState.roundHistory.map((h: RoundHistoryItem) => h.category);
+        
+        // Filter out categories already used, or use all categories if none available
+        let availableCategories = allCategories.filter(c => !usedCategories.includes(c));
+        if (availableCategories.length === 0) {
+          availableCategories = allCategories;
+        }
+        
+        // Update the game state for the next round
+        const updatedGameState: Partial<GameState> = {
+          status: 'category-selection',
+          round: roundNumber,
+          categorySelector: lowestScorePlayer,
+          categories: availableCategories,
+          answers: {}
+        };
+        
+        // Update the room with the new game state
+        const updatedRoom = await Room.findOneAndUpdate(
+          { code: roomCode },
+          { 
+            $set: { 
+              currentRound: roundNumber,
+              'gameState.status': updatedGameState.status,
+              'gameState.round': updatedGameState.round,
+              'gameState.categorySelector': updatedGameState.categorySelector,
+              'gameState.categories': updatedGameState.categories,
+              'gameState.answers': {}
+            } 
+          },
+          { new: true }
+        );
+        
+        if (!updatedRoom) {
+          console.log('Failed to update game state for next round');
           return;
         }
         
-        // Decrement time
-        let timeRemaining = currentRoom.gameState.timeRemaining - 1;
+        console.log(`Round ${roundNumber} started in room ${roomCode}`);
         
-        // Handle timer completion
-        if (timeRemaining <= 0) {
-          clearInterval(timer);
-          timeRemaining = 0;
-          console.log(`Timer reached zero for room ${roomCode}. Transitioning to results.`);
-          
-          // Save the time and emit the update
-          currentRoom.gameState.timeRemaining = timeRemaining;
-          await currentRoom.save();
-          io.to(roomCode).emit('timeUpdate', timeRemaining);
-          
-          // Automatically move to results when time is up
-          await judgeAnswers(roomCode);
-          return;
-        }
+        // Notify all players about the new round
+        broadcastRoomUpdate(roomCode, updatedRoom);
+        io.to(roomCode).emit('roundStarted', updatedRoom.gameState);
         
-        // Update the room with new time
-        currentRoom.gameState.timeRemaining = timeRemaining;
-        await currentRoom.save();
-        
-        // Emit time update every second
-        io.to(roomCode).emit('timeUpdate', timeRemaining);
       } catch (error) {
-        console.error('Error updating timer:', error);
-        clearInterval(timer);
+        console.error('Error starting next round:', error);
       }
-    }, 1000);
-  } catch (error) {
-    console.error('Error starting timer:', error);
-  }
-};
+    }
 
-/**
- * Judge the answers and update scores
- */
-async function judgeAnswers(roomCode: string) {
-  try {
-    // Find the room
-    const room = await Room.findOne({ code: roomCode });
-    if (!room || !room.gameState) {
-      console.log('Room not found or game state missing');
-      return;
-    }
-    
-    // Update status to judging
-    await Room.updateOne(
-      { code: roomCode },
-      { $set: { 'gameState.status': 'judging' } }
-    );
-    
-    const updatedRoom = await Room.findOne({ code: roomCode });
-    io.to(roomCode).emit('roomUpdate', updatedRoom);
-    io.to(roomCode).emit('judgingStarted');
-    
-    // Get the answers, category, and question
-    const gameState = updatedRoom.gameState;
-    const answers = gameState.answers || {};
-    const category = gameState.currentCategory as GameCategory;
-    const judgingStyle = gameState.judgingStyle as JudgingStyle;
-    const question = gameState.question || '';
-    
-    // Convert Mongoose Map to plain object if needed
-    let answersObj: Record<string, string> = {};
-    if (answers instanceof Map) {
-      // Convert standard Map to object
-      answersObj = Object.fromEntries(answers);
-    } else if (answers instanceof Object && typeof answers.toJSON === 'function') {
-      // Handle Mongoose Map/Document with toJSON method
-      const jsonObj = answers.toJSON();
-      for (const [key, value] of Object.entries(jsonObj)) {
-        if (!key.startsWith('$')) { // Skip Mongoose internal keys
-          answersObj[key] = value as string;
-        }
-      }
-    } else {
-      // It's already an object
-      answersObj = answers as Record<string, string>;
-    }
-    
-    // Use AI to judge the answers
-    const judgingResult = await AIService.judgeAnswers(
-      category,
-      judgingStyle,
-      question,
-      answersObj
-    );
-    
-    // Award points to winners (3 points each)
-    const pointsPerWin = 3;
-    const updatedScores = { ...(gameState.scores || {}) };
-    
-    judgingResult.winners.forEach(playerId => {
-      updatedScores[playerId] = (updatedScores[playerId] || 0) + pointsPerWin;
+    // Start the server on the specified port
+    const serverInstance = server.listen(3000, () => {
+      console.log('> Ready on http://localhost:3000');
     });
-    
-    // Save the round history
-    // Create a clean version of the answers object for storage
-    const cleanAnswers: Record<string, string> = {};
-    Object.keys(answersObj).forEach(key => {
-      cleanAnswers[key] = answersObj[key];
-    });
-    
-    const roundHistory = [...(gameState.roundHistory || [])];
-    roundHistory.push({
-      round: gameState.round,
-      category,
-      question,
-      answers: cleanAnswers,
-      winners: judgingResult.winners,
-      explanation: judgingResult.explanation
-    });
-    
-    // Update the game state with judging results and scores
-    await Room.updateOne(
-      { code: roomCode },
-      { 
-        $set: { 
-          'gameState.status': 'results',
-          'gameState.judgingResult': judgingResult,
-          'gameState.scores': updatedScores,
-          'gameState.roundHistory': roundHistory
-        } 
-      }
-    );
-    
-    const finalUpdatedRoom = await Room.findOne({ code: roomCode });
-    io.to(roomCode).emit('roomUpdate', finalUpdatedRoom);
-    io.to(roomCode).emit('judgingComplete', {
-      judgingResult,
-      scores: updatedScores
-    });
-    
-  } catch (error) {
-    console.error('Error judging answers:', error);
-  }
-}
 
-/**
- * Start the next round
- */
-async function startNextRound(roomCode: string, roundNumber: number) {
-  try {
-    // Find the room
-    const room = await Room.findOne({ code: roomCode });
-    if (!room || !room.gameState) {
-      console.log('Room not found or game state missing');
-      return;
-    }
-    
-    // Find player with lowest score to select the next category
-    const scores = room.gameState.scores || {};
-    let lowestScore = Infinity;
-    let lowestScorePlayer = '';
-    
-    Object.entries(scores).forEach(([playerId, score]) => {
-      if ((score as number) < lowestScore) {
-        lowestScore = score as number;
-        lowestScorePlayer = playerId;
-      }
-    });
-    
-    // If somehow there's no lowest (all equal), pick a random player
-    if (!lowestScorePlayer && room.players.length > 0) {
-      const randomIndex = Math.floor(Math.random() * room.players.length);
-      lowestScorePlayer = room.players[randomIndex].id;
-    }
-    
-    // Get available categories
-    const allCategories: GameCategory[] = ['business', 'scenario', 'wouldYouRather', 'pleadForYourLife', 'escape'];
-    const usedCategories = room.gameState.roundHistory.map((h: RoundHistoryItem) => h.category);
-    
-    // Filter out categories already used, or use all categories if none available
-    let availableCategories = allCategories.filter(c => !usedCategories.includes(c));
-    if (availableCategories.length === 0) {
-      availableCategories = allCategories;
-    }
-    
-    // Update the game state for the next round
-    const updatedGameState: Partial<GameState> = {
-      status: 'category-selection',
-      round: roundNumber,
-      categorySelector: lowestScorePlayer,
-      categories: availableCategories,
-      answers: {}
+    // Handle graceful shutdown
+    const gracefulShutdown = (signal: string) => {
+      console.log(`\n${signal} received. Gracefully shutting down...`);
+      
+      // First close the HTTP server
+      serverInstance.close(() => {
+        console.log('HTTP server closed.');
+        
+        // Close all socket connections
+        io.close(() => {
+          console.log('Socket.IO connections closed.');
+          
+          // Close MongoDB connection
+          mongoose.connection.close(false)
+            .then(() => {
+              console.log('MongoDB connection closed gracefully.');
+              process.exit(0);
+            })
+            .catch(err => {
+              console.error('Error closing MongoDB connection:', err);
+              process.exit(1);
+            });
+        });
+      });
+      
+      // Set a timeout for forceful exit if graceful shutdown takes too long
+      setTimeout(() => {
+        console.error('Forceful shutdown after timeout!');
+        process.exit(1);
+      }, 10000); // 10 seconds timeout
     };
     
-    // Update the room with the new game state
-    const updatedRoom = await Room.findOneAndUpdate(
-      { code: roomCode },
-      { 
-        $set: { 
-          currentRound: roundNumber,
-          'gameState.status': updatedGameState.status,
-          'gameState.round': updatedGameState.round,
-          'gameState.categorySelector': updatedGameState.categorySelector,
-          'gameState.categories': updatedGameState.categories,
-          'gameState.answers': {}
-        } 
-      },
-      { new: true }
-    );
+    // Listen for termination signals
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
     
-    if (!updatedRoom) {
-      console.log('Failed to update game state for next round');
-      return;
-    }
+    // Handle uncaught exceptions and rejections
+    process.on('uncaughtException', (error) => {
+      console.error('Uncaught Exception:', error);
+      gracefulShutdown('uncaughtException');
+    });
     
-    console.log(`Round ${roundNumber} started in room ${roomCode}`);
-    
-    // Notify all players about the new round
-    io.to(roomCode).emit('roomUpdate', updatedRoom);
-    io.to(roomCode).emit('roundStarted', updatedRoom.gameState);
-    
-  } catch (error) {
-    console.error('Error starting next round:', error);
-  }
-} 
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+      // Don't shutdown for unhandled rejections, just log them
+    });
+  })
+  .catch(err => {
+    clearTimeout(nextJsTimeout);
+    console.error('Error preparing Next.js app:', err);
+    process.exit(1);
+  }); 

@@ -4,11 +4,15 @@
   "private": true,
   "scripts": {
     "dev": "ts-node --project tsconfig.server.json server.ts",
+    "next-dev": "next dev",
+    "server": "ts-node --project tsconfig.server.json server.ts",
     "build": "next build",
     "start": "NODE_ENV=production ts-node --project tsconfig.server.json server.ts",
     "lint": "next lint",
-    "clean": "node clean.js",
-    "dev:clean": "npm run clean && npm run dev"
+    "clean": "node scripts/clean.js",
+    "dev:clean": "rimraf .next && ts-node --project tsconfig.server.json server.ts",
+    "force-clean": "rimraf .next .next-* && npm run dev",
+    "restart": "node scripts/clean.js && npm run dev"
   },
   "dependencies": {
     "@radix-ui/react-avatar": "^1.0.4",
@@ -24,7 +28,6 @@
     "react": "18.2.0",
     "react-dom": "18.2.0",
     "react-hot-toast": "^2.5.2",
-    "rimraf": "^6.0.1",
     "socket.io": "^4.7.4",
     "socket.io-client": "^4.7.4",
     "tailwind-merge": "^2.2.1",
@@ -39,6 +42,7 @@
     "eslint": "^8",
     "eslint-config-next": "14.1.0",
     "postcss": "^8",
+    "rimraf": "^6.0.1",
     "tailwindcss": "^3.3.0",
     "ts-node": "^10.9.2",
     "typescript": "^5"

@@ -34,5 +34,5 @@ export const joinRoom = (roomCode: string) => {
 
 export const leaveRoom = (roomCode: string) => {
   const socket = getSocket();
-  socket.emit('leave-room', roomCode);
+  socket.emit('leaveRoom', roomCode);
 }; 

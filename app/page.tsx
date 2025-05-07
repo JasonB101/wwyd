@@ -15,6 +15,7 @@ export default function HomePage() {
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checkingRoom, setCheckingRoom] = useState(true);
+  const [recentlyLeft, setRecentlyLeft] = useState(false);
 
   // Check for existing room connection
   useEffect(() => {
@@ -54,6 +55,23 @@ export default function HomePage() {
             }
           }
         }
+
+        // Check if player just left a room (within last few seconds)
+        const leftTimestamp = localStorage.getItem('leftRoomAt');
+        if (leftTimestamp) {
+          const leftTime = parseInt(leftTimestamp, 10);
+          const now = Date.now();
+          const timeSinceLeft = now - leftTime;
+          
+          // If left within last 3 seconds, show temporary message
+          if (timeSinceLeft < 3000) {
+            setRecentlyLeft(true);
+            setTimeout(() => setRecentlyLeft(false), 3000 - timeSinceLeft);
+          } else {
+            // Clear the timestamp if it's older
+            localStorage.removeItem('leftRoomAt');
+          }
+        }
       } catch (error) {
         console.error('Error checking existing room:', error);
       } finally {
@@ -67,6 +85,7 @@ export default function HomePage() {
   const handleCreateRoom = async () => {
     if (!nickname.trim()) return;
     setCreating(true);
+    setError(null);
     try {
       const response = await fetch('/api/rooms/create', {
         method: 'POST',
@@ -84,6 +103,15 @@ export default function HomePage() {
       }
 
       const data = await response.json();
+      
+      // Clear any existing room info first
+      Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('room_') || key === 'playerInfo') {
+          localStorage.removeItem(key);
+        }
+      });
+      
+      // Set room-specific localStorage entries
       localStorage.setItem(`room_${data.room.code}_playerId`, data.playerId);
       localStorage.setItem(`room_${data.room.code}_nickname`, nickname.trim());
       
@@ -107,6 +135,7 @@ export default function HomePage() {
   const handleJoinRoom = async () => {
     if (!roomCode.trim() || !nickname.trim()) return;
     setJoining(true);
+    setError(null);
     try {
       const response = await fetch('/api/rooms/join', {
         method: 'POST',
@@ -120,11 +149,29 @@ export default function HomePage() {
       });
 
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to join room');
+        const errorData = await response.json();
+        
+        // If the server tells us to clear storage, do it
+        if (errorData.clearStorage) {
+          console.log('Server requested storage cleanup for this room');
+          localStorage.removeItem(`room_${roomCode.trim()}_playerId`);
+          localStorage.removeItem(`room_${roomCode.trim()}_nickname`);
+          localStorage.removeItem('playerInfo');
+        }
+        
+        throw new Error(errorData.error || 'Failed to join room');
       }
 
       const data = await response.json();
+      
+      // Clear any existing room info first
+      Object.keys(localStorage).forEach(key => {
+        if (key.startsWith('room_') || key === 'playerInfo') {
+          localStorage.removeItem(key);
+        }
+      });
+      
+      // Set room-specific localStorage entries
       localStorage.setItem(`room_${data.room.code}_playerId`, data.playerId);
       localStorage.setItem(`room_${data.room.code}_nickname`, nickname.trim());
       
@@ -137,7 +184,10 @@ export default function HomePage() {
       console.log('Setting playerInfo in localStorage:', playerInfo);
       localStorage.setItem('playerInfo', JSON.stringify(playerInfo));
       
-      router.push(`/room/${data.room.code}`);
+      // Small delay to ensure localStorage is set before navigation
+      setTimeout(() => {
+        router.push(`/room/${data.room.code}`);
+      }, 100);
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Failed to join room');
     } finally {
@@ -199,6 +249,14 @@ export default function HomePage() {
 
           {error && (
             <p className="text-sm text-red-500">{error}</p>
+          )}
+
+          {recentlyLeft && (
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-md mb-4">
+              <p className="text-sm text-yellow-800">
+                You've just left a room. Please wait a moment before rejoining with the same nickname.
+              </p>
+            </div>
           )}
 
           <div className="flex gap-4">

@@ -31,28 +31,54 @@ export async function POST(req: Request) {
       );
     }
 
-    // Check if nickname is already taken
-    const existingPlayerWithSameNickname = room.players.find(p => p.nickname.toLowerCase() === nickname.toLowerCase());
+    // Check if nickname is already taken by ANY player (not just connected ones)
+    // This prevents conflicts if a player disconnects and another tries to take their name
+    const existingPlayerWithSameNickname = room.players.find(
+      p => p.nickname.toLowerCase() === nickname.toLowerCase()
+    );
+    
     if (existingPlayerWithSameNickname) {
+      console.log(`Nickname "${nickname}" already taken in room ${code} by player ${existingPlayerWithSameNickname.id}`);
       return NextResponse.json(
-        { error: 'This nickname is already taken in this room' },
+        { 
+          error: 'This nickname is already taken in this room. If you just left the room, please wait a moment or try a different nickname.',
+          clearStorage: true // Signal to client to clear storage for this room
+        },
         { status: 400 }
       );
     }
 
-    // Generate a player ID but DON'T add to room yet - socket connection will handle that
+    // Generate a player ID
     const playerId = uuidv4();
     
-    console.log('Player prepared to join room:', {
+    // Add the player to the room with isConnected=false initially
+    // The socket connection will mark them as connected
+    const updatedRoom = await Room.findOneAndUpdate(
+      { code },
+      {
+        $push: {
+          players: {
+            id: playerId,
+            nickname,
+            isHost: false,
+            isConnected: false // Socket will mark them connected when they actually connect
+          }
+        }
+      },
+      { new: true }
+    );
+    
+    console.log('Player added to room via API:', {
       code: room.code,
       playerId,
-      nickname
+      nickname,
+      playerCount: updatedRoom?.players.length
     });
 
     return NextResponse.json({
-      room,
+      room: updatedRoom,
       playerId,
-      isHost: room.players.length === 0 // Will be host if first player
+      isHost: false
     });
   } catch (error) {
     console.error('Error joining room:', error);

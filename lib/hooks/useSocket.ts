@@ -368,19 +368,37 @@ export function useSocket() {
         if (playerInfoStr) {
           const playerInfo = JSON.parse(playerInfoStr);
           if (playerInfo.roomCode) {
+            console.log(`Emitting leaveRoom event for room ${playerInfo.roomCode}`);
+            
             // Set timestamp when we left
             localStorage.setItem('leftRoomAt', Date.now().toString());
             
-            // Emit leave room event
+            // Emit leave room event and wait for acknowledgement before disconnecting
             socketInstance.emit('leaveRoom', playerInfo.roomCode);
+            
+            // IMPORTANT: Add a small delay before disconnecting to ensure the event is sent
+            setTimeout(() => {
+              console.log('Disconnecting socket after leaveRoom event');
+              // Disconnect socket AFTER the event has time to be sent
+              socketInstance.disconnect();
+              socketInstance = null;
+            }, 300); // Give it 300ms to ensure the event is transmitted
+            
+            return; // Exit early to prevent immediate disconnection
           }
         }
         
-        // Disconnect socket
+        // If we don't have room info or some other issue occurred, disconnect immediately
+        console.log('No room info found, disconnecting socket directly');
         socketInstance.disconnect();
         socketInstance = null;
       } catch (error) {
         console.error('Error during leaveRoom:', error);
+        // Still try to disconnect the socket in case of error
+        if (socketInstance) {
+          socketInstance.disconnect();
+          socketInstance = null;
+        }
       }
     }
   };

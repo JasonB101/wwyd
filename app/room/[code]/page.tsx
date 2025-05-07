@@ -587,11 +587,12 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   };
 
   const handleLeaveRoom = async () => {
-    console.log('Leaving room');
+    console.log('===== LEAVE ROOM BUTTON CLICKED =====');
     
     try {
       // Set timestamp that we left the room
       localStorage.setItem('leftRoomAt', Date.now().toString());
+      console.log(`Room code to leave: ${params.code}`);
       
       // Clean up localStorage first
       localStorage.removeItem('playerInfo');
@@ -600,18 +601,43 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
       // Use the socket hook's leaveRoom function if available
       if (socket && socket.connected) {
+        console.log(`Socket connected: ${socket.id}, sending leave room event`);
+        
         if (typeof leaveRoom === 'function') {
-          // Use the clean helper function
+          // Make sure the leaveRoom function gets the room code as a parameter
+          console.log('Using leaveRoom function from hook');
+          
+          // Store room code in localStorage before calling leaveRoom
+          // This ensures the hook function can access the correct room code
+          const playerInfo = {
+            roomCode: params.code,
+            playerId: playerId
+          };
+          localStorage.setItem('playerInfo', JSON.stringify(playerInfo));
+          
+          // Now call the hook's leaveRoom function
           leaveRoom();
         } else {
           // Fallback to manual method
+          console.log('Using fallback method for leaving room');
           socket.emit('leaveRoom', params.code);
-          socket.disconnect();
+          
+          // Add delay before disconnecting
+          setTimeout(() => {
+            console.log('Disconnecting socket after leave room event');
+            socket.disconnect();
+          }, 300);
         }
+      } else {
+        console.log('Socket not connected, cannot emit leaveRoom event');
       }
 
-      // Redirect to home page
-      router.push('/');
+      // Wait a moment before redirecting to allow the socket event to be sent
+      console.log('Waiting 500ms before redirecting to home page');
+      setTimeout(() => {
+        console.log('Redirecting to home page');
+        router.push('/');
+      }, 500);
     } catch (error) {
       console.error('Error leaving room:', error);
       // Even if there's an error, try to clean up and redirect

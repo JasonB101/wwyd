@@ -533,7 +533,8 @@ app.prepare()
        * Removes a player from a room, reassigns host if needed, and broadcasts the update
        */
       socket.on('leaveRoom', async (roomCode: string) => {
-        console.log(`Leave room event: ${roomCode}, Socket: ${socket.id}`);
+        console.log(`========== LEAVE ROOM EVENT RECEIVED ==========`);
+        console.log(`Socket ${socket.id} is leaving room ${roomCode}`);
         
         try {
           // Get player info from socket mapping
@@ -543,6 +544,8 @@ app.prepare()
             socket.emit('error', 'Not connected to a room');
             return;
           }
+
+          console.log(`Processing leave room for player ${playerInfo.nickname} (${playerInfo.playerId})`);
 
           // Ensure database connection
           await connectToDatabase();
@@ -568,6 +571,8 @@ app.prepare()
           const leavingPlayerNickname = leavingPlayer.nickname;
 
           // CRITICAL FIX: Use findOneAndUpdate for atomic removal operation
+          // Intentional leave = immediate removal (no delay needed)
+          console.log(`Immediately removing player ${leavingPlayerNickname} (intentional leave)`);
           const updatedRoomDoc = await Room.findOneAndUpdate(
             { code: roomCode },
             { $pull: { players: { id: playerInfo.playerId } } },
@@ -627,10 +632,16 @@ app.prepare()
           // Notify client to clear storage for this room
           socket.emit('clearRoomStorage', { roomCode });
           
+          // Confirm leave room was processed successfully
+          socket.emit('leftRoom', { roomCode, success: true });
+          
+          console.log(`========== LEAVE ROOM COMPLETE FOR ${leavingPlayerNickname} ==========`);
+          
           // Disconnect this socket with a small delay to ensure messages are sent
           setTimeout(() => {
             try {
               if (socket.connected) {
+                console.log(`Disconnecting socket ${socket.id} after successful leave room`);
                 socket.disconnect(true);
               }
             } catch (error) {
@@ -1195,13 +1206,14 @@ app.prepare()
 
       /**
        * Socket disconnect handler
-       * Removes players from the room when they disconnect
+       * !!!IMPORTANT!!! - Only marks players as disconnected and NEVER removes them automatically
        */
       socket.on('disconnect', async () => {
         console.log(`Socket disconnected: ${socket.id}`);
         const playerInfo = socketToPlayer.get(socket.id);
         
         if (playerInfo) {
+          console.log(`*** UPDATED DISCONNECT HANDLER V2 - NO AUTO REMOVAL ***`);
           console.log(`Player disconnected: ${playerInfo.nickname} (${playerInfo.playerId}) from room ${playerInfo.roomCode}`);
           
           try {
@@ -1217,82 +1229,37 @@ app.prepare()
             }
             
             // Check if the player is in the room
-            const leavingPlayer = room.players.find((p: Player) => p.id === playerInfo.playerId);
-            if (!leavingPlayer) {
+            const disconnectingPlayer = room.players.find((p: Player) => p.id === playerInfo.playerId);
+            if (!disconnectingPlayer) {
               console.log(`Player ${playerInfo.playerId} already removed from room ${playerInfo.roomCode}`);
               socketToPlayer.delete(socket.id);
               return;
             }
             
-            const wasHost = leavingPlayer.isHost;
-            const playerNickname = leavingPlayer.nickname;
-            
-            // IMPORTANT FIX: For quick page refreshes, mark as disconnected first 
-            // instead of immediate removal
-            console.log(`Marking player ${playerNickname} as disconnected (delaying removal)`);
+            const playerNickname = disconnectingPlayer.nickname;
+
+            // ONLY mark the player as disconnected - NEVER remove them automatically
+            console.log(`=== KEEPING PLAYER ${playerNickname} IN ROOM - MARKING DISCONNECTED ONLY ===`);
             await Room.updateOne(
               { code: playerInfo.roomCode, 'players.id': playerInfo.playerId },
               { $set: { 'players.$.isConnected': false } }
             );
             
-            // Update other clients
+            // Update clients about the disconnected status
             const updatedRoom = await Room.findOne({ code: playerInfo.roomCode });
             if (updatedRoom) {
               await broadcastRoomUpdate(playerInfo.roomCode, updatedRoom);
+              console.log(`Room update sent to mark ${playerNickname} as disconnected (player remains in room indefinitely)`);
+              logSocketsInRoom(playerInfo.roomCode);
             }
             
-            // Remove socket from tracking
+            // Clean up socket tracking
             socketToPlayer.delete(socket.id);
             socket.leave(playerInfo.roomCode);
             
-            // Remove player immediately without waiting
-            console.log(`Immediately removing player ${playerNickname} (no reconnection grace period)`);
-
-            // Use findOneAndUpdate for atomic operation (same as in kickPlayer)
-            try {
-              const updatedRoomDoc = await Room.findOneAndUpdate(
-                { code: playerInfo.roomCode },
-                { $pull: { players: { id: playerInfo.playerId } } },
-                { new: true }
-              );
-              
-              if (!updatedRoomDoc) {
-                console.log(`Failed to update room ${playerInfo.roomCode} during immediate disconnect`);
-                return;
-              }
-              
-              console.log(`Successfully removed player ${playerNickname} from database. Remaining players: ${updatedRoomDoc.players.length}`);
-              
-              // Invalidate the room cache
-              invalidateRoomCache(playerInfo.roomCode);
-                
-              // If the leaving player was the host and there are other players, assign a new host
-              if (wasHost && updatedRoomDoc.players.length > 0) {
-                console.log(`Previous host disconnected, transferring host status to next player in line`);
-                await transferHostStatus(playerInfo.roomCode);
-                
-                // Get the latest room data after host transfer
-                invalidateRoomCache(playerInfo.roomCode);
-                const roomAfterHostTransfer = await getRoomWithCache(playerInfo.roomCode, true);
-                if (roomAfterHostTransfer) {
-                  // Use the updated room for subsequent operations
-                  Object.assign(updatedRoomDoc, roomAfterHostTransfer);
-                }
-              }
-                
-              if (updatedRoomDoc.players.length === 0) {
-                // Schedule room for deletion instead of deleting immediately
-                console.log(`Room ${playerInfo.roomCode} is now empty, scheduling for deletion`);
-                scheduleRoomDeletion(playerInfo.roomCode);
-              } else {
-                // Notify remaining players about the updated room state
-                await broadcastRoomUpdate(playerInfo.roomCode, updatedRoomDoc);
-                console.log(`Room update sent to ${updatedRoomDoc.players.length} remaining players after ${playerNickname} disconnected`);
-                logSocketsInRoom(playerInfo.roomCode);
-              }
-            } catch (error) {
-              console.error('Error handling immediate disconnect removal:', error);
-            }
+            // No automatic removal under any circumstances
+            console.log(`=== DISCONNECT COMPLETE - PLAYER ${playerNickname} REMAINS IN ROOM ===`);
+            
           } catch (error) {
             console.error('Error handling disconnect:', error);
             socketToPlayer.delete(socket.id);

@@ -20,67 +20,64 @@ export default function HomePage() {
   // Check for existing room connection
   useEffect(() => {
     const checkExistingRoom = async () => {
-      try {
-        // Get all room keys from localStorage
-        const roomKeys = Object.keys(localStorage).filter(key => key.startsWith('room_'));
-        
-        for (const key of roomKeys) {
-          const code = key.split('_')[1];
-          const playerId = localStorage.getItem(`room_${code}_playerId`);
-          const nickname = localStorage.getItem(`room_${code}_nickname`);
-
-          if (playerId && nickname) {
-            // Verify the room still exists and player is still in it
-            const response = await fetch(`/api/rooms?code=${code}`);
+      // Check if we have playerInfo in localStorage
+      const playerInfoStr = localStorage.getItem('playerInfo');
+      
+      if (playerInfoStr) {
+        try {
+          const playerInfo = JSON.parse(playerInfoStr);
+          if (playerInfo.roomCode && playerInfo.playerId && playerInfo.nickname) {
+            // Check if room still exists
+            const response = await fetch(`/api/rooms?code=${playerInfo.roomCode}`);
             if (response.ok) {
-              const room = await response.json();
-              const player = room.players.find((p: any) => p.id === playerId);
-              
-              if (player) {
-                // Room exists and player is still in it, but don't auto-redirect
-                // Instead, show a message that they can rejoin
-                console.log('Found existing room connection:', { code, playerId, nickname });
-                // Clean up localStorage to prevent auto-rejoin
-                localStorage.removeItem(`room_${code}_playerId`);
-                localStorage.removeItem(`room_${code}_nickname`);
-              } else {
-                // Player not found in room, clean up localStorage
-                localStorage.removeItem(`room_${code}_playerId`);
-                localStorage.removeItem(`room_${code}_nickname`);
-              }
+              router.push(`/room/${playerInfo.roomCode}`);
+              return;
             } else {
-              // Room doesn't exist, clean up localStorage
-              localStorage.removeItem(`room_${code}_playerId`);
-              localStorage.removeItem(`room_${code}_nickname`);
+              console.log('Previously joined room no longer exists, clearing localStorage');
+              localStorage.removeItem('playerInfo');
+              Object.keys(localStorage).forEach(key => {
+                if (key.startsWith('room_')) {
+                  localStorage.removeItem(key);
+                }
+              });
             }
           }
+        } catch (error) {
+          console.error('Error checking existing room:', error);
+          localStorage.removeItem('playerInfo');
         }
-
-        // Check if player just left a room (within last few seconds)
-        const leftTimestamp = localStorage.getItem('leftRoomAt');
-        if (leftTimestamp) {
-          const leftTime = parseInt(leftTimestamp, 10);
-          const now = Date.now();
-          const timeSinceLeft = now - leftTime;
-          
-          // If left within last 3 seconds, show temporary message
-          if (timeSinceLeft < 3000) {
-            setRecentlyLeft(true);
-            setTimeout(() => setRecentlyLeft(false), 3000 - timeSinceLeft);
-          } else {
-            // Clear the timestamp if it's older
-            localStorage.removeItem('leftRoomAt');
-          }
-        }
-      } catch (error) {
-        console.error('Error checking existing room:', error);
-      } finally {
-        setCheckingRoom(false);
       }
+      
+      // Check if user recently left a room
+      const leftRoomAt = localStorage.getItem('leftRoomAt');
+      if (leftRoomAt) {
+        const leftTime = parseInt(leftRoomAt, 10);
+        const now = Date.now();
+        const timeSinceLeft = now - leftTime;
+        
+        // If left less than 2 seconds ago, show a warning
+        if (timeSinceLeft < 2000) {
+          setRecentlyLeft(true);
+          setTimeout(() => setRecentlyLeft(false), 2000 - timeSinceLeft);
+        }
+        
+        // Clean up the leftRoomAt value after 5 seconds
+        if (timeSinceLeft > 5000) {
+          localStorage.removeItem('leftRoomAt');
+        }
+      }
+      
+      setCheckingRoom(false);
     };
-
+    
     checkExistingRoom();
   }, [router]);
+
+  // Add room code validation function
+  const isValidRoomCode = (code: string) => {
+    // Room code must be exactly 4 digits
+    return /^\d{4}$/.test(code);
+  };
 
   const handleCreateRoom = async () => {
     if (!nickname.trim()) return;
@@ -224,11 +221,15 @@ export default function HomePage() {
               className="w-full"
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && nickname.trim()) {
-                  if (roomCode.trim()) {
+                  // If the room code is valid, join room
+                  if (isValidRoomCode(roomCode)) {
                     handleJoinRoom();
-                  } else {
+                  } 
+                  // If the room code field is empty, create room
+                  else if (roomCode.trim().length === 0) {
                     handleCreateRoom();
                   }
+                  // Otherwise, do nothing (neither button would be enabled)
                 }
               }}
             />
@@ -241,10 +242,20 @@ export default function HomePage() {
             <Input
               id="roomCode"
               value={roomCode}
-              onChange={(e) => setRoomCode(e.target.value)}
-              placeholder="Enter room code to join"
+              onChange={(e) => {
+                // Only allow digits and limit to 4 characters
+                const value = e.target.value.replace(/\D/g, '').slice(0, 4);
+                setRoomCode(value);
+              }}
+              placeholder="Enter 4-digit room code"
               className="w-full"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={4}
             />
+            {roomCode.trim().length > 0 && !isValidRoomCode(roomCode) && (
+              <p className="mt-1 text-xs text-amber-600">Room code must be exactly 4 digits</p>
+            )}
           </div>
 
           {error && (
@@ -262,16 +273,18 @@ export default function HomePage() {
           <div className="flex gap-4">
             <Button
               onClick={handleCreateRoom}
-              disabled={creating || joining || !nickname.trim()}
+              disabled={creating || joining || !nickname.trim() || roomCode.trim().length > 0}
               className="flex-1"
+              title={roomCode.trim().length > 0 ? "Clear room code to create a new room" : "Create a new room"}
             >
               {creating ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
               Create Room
             </Button>
             <Button
               onClick={handleJoinRoom}
-              disabled={creating || joining || !roomCode.trim() || !nickname.trim()}
+              disabled={creating || joining || !isValidRoomCode(roomCode) || !nickname.trim()}
               className="flex-1"
+              title={!isValidRoomCode(roomCode) ? "Room code must be exactly 4 digits" : "Join an existing room"}
             >
               {joining ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
               Join Room

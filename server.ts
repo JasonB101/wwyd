@@ -13,6 +13,12 @@ import mongoose from 'mongoose';
 // Load environment variables
 dotenv.config({ path: '.env.local' });
 
+// Initialize AIService - reset counter and prepare for a fresh start
+console.log('Initializing AIService...');
+AIService.resetApiCallCounter();
+AIService.clearCache();
+// Questions will be fetched when games start, not at server startup
+
 /**
  * Type definitions
  */
@@ -130,14 +136,36 @@ let io: SocketIOServer;
 // Helper function to format room for client
 function formatRoomForClient(room: any) {
   if (!room) return null;
-  // Return a simplified version of the room without sensitive info
-  return {
-    code: room.code,
-    status: room.status,
-    players: room.players,
-    currentRound: room.currentRound,
-    game: room.game
-  };
+  
+  try {
+    // Make sure room code is properly preserved and never becomes "unknown"
+    const roomCode = room.code || (room._id ? String(room._id) : 'unknown');
+    
+    // Create a proper copy of the room object with null/undefined checks
+    const formattedRoom = {
+      code: roomCode,
+      status: room.status || 'unknown',
+      players: Array.isArray(room.players) ? room.players : [],
+      currentRound: room.currentRound || 0,
+      gameState: room.gameState ? { ...room.gameState } : null
+    };
+    
+    // Ensure room code is consistent in logs
+    console.log(`[formatRoomForClient] Room ${formattedRoom.code} has game state: ${formattedRoom.gameState?.status || 'unknown'}`);
+    console.log(`[formatRoomForClient] Game state details: round=${formattedRoom.gameState?.round || 0}, players=${formattedRoom.players.length}`);
+    
+    return formattedRoom;
+  } catch (error) {
+    console.error(`[formatRoomForClient] Error formatting room:`, error);
+    // Return a minimal valid object in case of error, still preserving room code
+    return {
+      code: room?.code || (room?._id ? String(room._id) : 'unknown'),
+      status: room?.status || 'unknown',
+      players: Array.isArray(room?.players) ? room.players : [],
+      currentRound: room?.currentRound || 0,
+      gameState: room?.gameState ? { ...room.gameState } : null
+    };
+  }
 }
 
 // Add timeout protection for Next.js app preparation
@@ -267,8 +295,8 @@ app.prepare()
                 
                 // Even if already connected, we update to ensure proper status
                 await Room.updateOne(
-                  { code: roomCodeStr, 'players.id': playerIdStr },
-                  { $set: { 'players.$.isConnected': true } }
+                  { code: roomCodeStr, "players.id": playerIdStr },
+                  { $set: { "players.$.isConnected": true } }
                 );
                 
                 // Send immediate confirmation to this player
@@ -295,7 +323,7 @@ app.prepare()
                       socket.emit('gameState', updatedRoom.gameState);
                       
                       if (updatedRoom.gameState.status === 'answering' && updatedRoom.gameState.timeRemaining) {
-                        socket.emit('timeUpdate', updatedRoom.gameState.timeRemaining);
+                        socket.emit('timerUpdate', updatedRoom.gameState.timeRemaining);
                       }
                     }
                     
@@ -342,7 +370,7 @@ app.prepare()
           const room = await Room.findOne({ code: data.roomCode });
           if (!room) {
             console.log(`Room ${data.roomCode} not found during reconnection`);
-            socket.emit('error', { message: 'Room not found' });
+            socket.emit('error', 'Room not found');
             return;
           }
           
@@ -353,8 +381,8 @@ app.prepare()
             
             // Update player to connected status
             await Room.updateOne(
-              { code: data.roomCode, 'players.id': data.playerId },
-              { $set: { 'players.$.isConnected': true } }
+              { code: data.roomCode, "players.id": data.playerId },
+              { $set: { "players.$.isConnected": true } }
             );
             
             // Update socket to player mapping
@@ -390,7 +418,7 @@ app.prepare()
           }
         } catch (error) {
           console.error('Error handling playerReconnected:', error);
-          socket.emit('error', { message: 'Failed to reconnect to room' });
+          socket.emit('error', 'Failed to reconnect to room');
         }
       });
 
@@ -409,7 +437,7 @@ app.prepare()
           const room = await Room.findOne({ code: data.roomCode });
           if (!room) {
             console.log(`Room ${data.roomCode} not found`);
-            socket.emit('error', { message: 'Room not found' });
+            socket.emit('error', 'Room not found');
             return;
           }
           
@@ -422,8 +450,8 @@ app.prepare()
               // Update player's connection status if they were disconnected
               if (!existingPlayer.isConnected) {
                 await Room.updateOne(
-                  { code: data.roomCode, 'players.id': data.playerId },
-                  { $set: { 'players.$.isConnected': true } }
+                  { code: data.roomCode, "players.id": data.playerId },
+                  { $set: { "players.$.isConnected": true } }
                 );
               }
               
@@ -524,7 +552,7 @@ app.prepare()
           logSocketsInRoom(data.roomCode);
         } catch (error) {
           console.error('Error joining room:', error);
-          socket.emit('error', { message: 'Failed to join room' });
+          socket.emit('error', 'Failed to join room');
         }
       });
 
@@ -696,6 +724,16 @@ app.prepare()
             return;
           }
 
+          // Clear existing question cache and fetch fresh questions for this game
+          console.log(`Fetching fresh questions for room ${roomCode}`);
+          AIService.clearCache();
+          AIService.fetchAllCategoryQuestions().then(() => {
+            console.log(`Successfully fetched fresh questions for room ${roomCode}`);
+          }).catch(error => {
+            console.error(`Error fetching questions for room ${roomCode}:`, error);
+            // Game will still work with fallback questions if fetch fails
+          });
+
           // Initialize scores for all players
           const initialScores: Record<string, number> = {};
           room.players.forEach((player: Player) => {
@@ -791,7 +829,10 @@ app.prepare()
 
           console.log(`Generating question for category: ${category}`);
           // Generate a question using the AI service
-          const { question, context } = await AIService.generateQuestion(category);
+          const questionResult = await AIService.generateQuestion(category);
+          const question = questionResult.questionText; // Use questionText instead of question
+          const judgingStyle = questionResult.judgingStyle; // Use the judgingStyle from the result
+          
           console.log(`Question generated: ${question}`);
           
           // Update game state to question display
@@ -799,8 +840,8 @@ app.prepare()
             status: 'question-display',
             currentCategory: category,
             question,
-            questionContext: context,
-            judgingStyle: AIService.getRandomJudgingStyle(),
+            questionContext: `You will be judged on ${judgingStyle}.`, // Create context from judgingStyle
+            judgingStyle, // Use the judgingStyle directly
             timeRemaining: 180, // 3 minutes (180 seconds) to answer
             answers: {}
           };
@@ -839,7 +880,10 @@ app.prepare()
           console.log(`Starting timer to transition to answering state (10s)`);
           setTimeout(async () => {
             try {
-              const currentRoom = await Room.findOne({ code: roomCode });
+              // Only check room status once when timer completes
+              await connectToDatabase();
+              const currentRoom = await Room.findOne({ code: roomCode }, { 'gameState.status': 1 });
+              
               if (!currentRoom) {
                 console.log(`Room ${roomCode} not found when transitioning to answering`);
                 return;
@@ -852,14 +896,21 @@ app.prepare()
                   { $set: { 'gameState.status': 'answering' } }
                 );
                 
-                const updatedRoom = await Room.findOne({ code: roomCode });
+                // Fetch full room data for the update - use getRoomWithCache to ensure we have the latest data
+                // This includes the room code to prevent "unknown" room issues
+                invalidateRoomCache(roomCode);
+                const updatedRoom = await getRoomWithCache(roomCode, true);
+                
                 if (!updatedRoom) {
                   console.log(`Failed to fetch updated room ${roomCode} after status change`);
                   return;
                 }
                 
                 console.log(`Broadcasting roomUpdate and answeringStarted events to room ${roomCode}`);
-                broadcastRoomUpdate(roomCode, updatedRoom);
+                // Use broadcastRoomUpdate to ensure the room is properly formatted with code
+                await broadcastRoomUpdate(roomCode, updatedRoom);
+                
+                // Send the answeringStarted event
                 io.to(roomCode).emit('answeringStarted');
                 
                 // Start the answer timer (180 seconds)
@@ -869,7 +920,7 @@ app.prepare()
                 console.log(`Room ${roomCode} is not in question-display state, cannot transition to answering. Current state: ${currentRoom.gameState?.status}`);
               }
             } catch (error) {
-              console.error(`Error transitioning to answering state: ${error}`);
+              console.error(`Error transitioning to answering state: ${error instanceof Error ? error.message : 'Unknown error'}`);
             }
           }, 10000); // 10 seconds to read the question
           
@@ -978,6 +1029,52 @@ app.prepare()
         } catch (error) {
           console.error('Error in submitAnswer:', error);
           socket.emit('error', 'Failed to submit answer');
+        }
+      });
+
+      /**
+       * Manual trigger for judging (TEMPORARY DEBUG HELPER)
+       * This helps unstick rooms that are in the judging state but not progressing
+       */
+      socket.on('triggerJudging', async () => {
+        try {
+          // Get player info from socket mapping
+          const playerInfo = socketToPlayer.get(socket.id);
+          if (!playerInfo) {
+            console.log('No player info found for socket');
+            socket.emit('error', 'Not connected to a room');
+            return;
+          }
+
+          console.log(`Manual judging trigger requested by ${playerInfo.nickname} for room ${playerInfo.roomCode}`);
+          
+          // Ensure database connection
+          await connectToDatabase();
+          
+          // Find the room
+          const room = await Room.findOne({ code: playerInfo.roomCode });
+          if (!room) {
+            console.log('Room not found:', playerInfo.roomCode);
+            socket.emit('error', 'Room not found');
+            return;
+          }
+
+          // Only proceed if in judging state
+          if (!room.gameState || room.gameState.status !== 'judging') {
+            console.log(`Cannot trigger judging: Room is not in judging state. Current state: ${room.gameState?.status}`);
+            socket.emit('error', `Room is not in judging state. Current state: ${room.gameState?.status}`);
+            return;
+          }
+
+          console.log(`Manually triggering judging process for room ${playerInfo.roomCode}`);
+          
+          // Call the judgeAnswers function to process the results
+          await judgeAnswers(playerInfo.roomCode);
+          
+          socket.emit('message', 'Judging process triggered manually');
+        } catch (error) {
+          console.error('Error in manual judging trigger:', error);
+          socket.emit('error', 'Failed to trigger judging');
         }
       });
 
@@ -1213,7 +1310,7 @@ app.prepare()
         const playerInfo = socketToPlayer.get(socket.id);
         
         if (playerInfo) {
-          console.log(`*** UPDATED DISCONNECT HANDLER V2 - NO AUTO REMOVAL ***`);
+          console.log(`=== KEEPING PLAYER ${playerInfo.nickname} IN ROOM - MARKING DISCONNECTED ONLY ===`);
           console.log(`Player disconnected: ${playerInfo.nickname} (${playerInfo.playerId}) from room ${playerInfo.roomCode}`);
           
           try {
@@ -1241,8 +1338,8 @@ app.prepare()
             // ONLY mark the player as disconnected - NEVER remove them automatically
             console.log(`=== KEEPING PLAYER ${playerNickname} IN ROOM - MARKING DISCONNECTED ONLY ===`);
             await Room.updateOne(
-              { code: playerInfo.roomCode, 'players.id': playerInfo.playerId },
-              { $set: { 'players.$.isConnected': false } }
+              { code: playerInfo.roomCode, "players.id": playerInfo.playerId },
+              { $set: { "players.$.isConnected": false } }
             );
             
             // Update clients about the disconnected status
@@ -1276,63 +1373,109 @@ app.prepare()
      * Start the answer timer
      */
     const startAnswerTimer = async (roomCode: string, duration: number) => {
+      console.log(`=== STARTING ANSWER TIMER FOR ROOM ${roomCode} (${duration}s) ===`);
+      
       try {
-        // Initialize timer in room
-        const room = await Room.findOne({ code: roomCode });
-        if (!room || !room.gameState) return;
+        // Initialize timer in room - only connect to database once at the start
+        await connectToDatabase();
         
-        room.gameState.timeRemaining = duration;
-        await room.save();
-        io.to(roomCode).emit('timeUpdate', duration);
+        const room = await getRoomWithCache(roomCode, true); // Force fresh data to get complete room
+        if (!room || !room.gameState) {
+          console.log(`Cannot start timer: Room ${roomCode} not found or has no game state`);
+          return;
+        }
         
-        // Start countdown
+        if (room.gameState.status !== 'answering') {
+          console.log(`Cannot start timer: Room ${roomCode} is not in answering state (current: ${room.gameState.status})`);
+          return;
+        }
+        
+        // Set initial time - store in memory, not in database
+        const initialTime = duration;
+        console.log(`Timer initialized for room ${roomCode}: ${initialTime}s`);
+        io.to(roomCode).emit('timerUpdate', initialTime);
+        
+        // Store vital room information to avoid querying the database on every tick
+        // This prevents room code from being lost during timer operation
+        const roomDetails = {
+          code: room.code,
+          currentRound: room.currentRound || 0
+        };
+        
+        // Game state tracking variables - store in memory to avoid DB checks
+        let timeRemaining = initialTime;
+        let lastDbCheckTime = Date.now();
+        let gameStatus = 'answering';
+        const DB_CHECK_INTERVAL = 15000; // Check database every 15 seconds
+        
         const timer = setInterval(async () => {
           try {
-            // Fetch the latest room state to ensure we have updated data
-            const currentRoom = await Room.findOne({ code: roomCode });
-            if (!currentRoom || !currentRoom.gameState) {
+            // Only check the database periodically (every 15 seconds) instead of every tick
+            const currentTime = Date.now();
+            if (currentTime - lastDbCheckTime >= DB_CHECK_INTERVAL) {
+              console.log(`Periodic DB check for room ${roomDetails.code} (every 15s)`);
+              lastDbCheckTime = currentTime;
+              
+              // Ensure database connection for periodic check
+              await connectToDatabase();
+              const currentRoom = await Room.findOne({ code: roomDetails.code });
+              
+              if (!currentRoom || !currentRoom.gameState) {
+                console.log(`Timer stopped: Room ${roomDetails.code} no longer exists`);
+                clearInterval(timer);
+                return;
+              }
+              
+              // Update our cached game status
+              gameStatus = currentRoom.gameState.status;
+              
+              // If the game is no longer in answering state, stop the timer
+              if (gameStatus !== 'answering') {
+                console.log(`Timer stopped: Room ${roomDetails.code} changed state to ${gameStatus}`);
+                clearInterval(timer);
+                return;
+              }
+            }
+            
+            // If game status changed through other events, stop the timer
+            if (gameStatus !== 'answering') {
+              console.log(`Timer stopped: Game status changed to ${gameStatus}`);
               clearInterval(timer);
               return;
             }
             
-            // If the game is no longer in answering state, stop the timer
-            if (currentRoom.gameState.status !== 'answering') {
-              clearInterval(timer);
-              return;
-            }
+            // Decrement time in memory
+            timeRemaining--;
             
-            // Decrement time
-            let timeRemaining = currentRoom.gameState.timeRemaining - 1;
+            // Only log every 15 seconds or when timer reaches zero
+            if (timeRemaining === 0 || timeRemaining % 15 === 0 || timeRemaining === initialTime - 1) {
+              console.log(`Room ${roomDetails.code} timer: ${timeRemaining}s remaining`);
+            }
             
             // Handle timer completion
             if (timeRemaining <= 0) {
               clearInterval(timer);
               timeRemaining = 0;
-              console.log(`Timer reached zero for room ${roomCode}. Transitioning to results.`);
+              console.log(`=== TIMER REACHED ZERO FOR ROOM ${roomDetails.code} ===`);
               
-              // Save the time and emit the update
-              currentRoom.gameState.timeRemaining = timeRemaining;
-              await currentRoom.save();
-              io.to(roomCode).emit('timeUpdate', timeRemaining);
+              // Emit the final update
+              io.to(roomDetails.code).emit('timerUpdate', timeRemaining);
               
-              // Automatically move to results when time is up
-              await judgeAnswers(roomCode);
+              // Automatically move to judging when time is up
+              console.log(`Starting judging process for room ${roomDetails.code}`);
+              await judgeAnswers(roomDetails.code);
               return;
             }
             
-            // Update the room with new time
-            currentRoom.gameState.timeRemaining = timeRemaining;
-            await currentRoom.save();
-            
-            // Emit time update every second
-            io.to(roomCode).emit('timeUpdate', timeRemaining);
+            // Emit time update every second without updating database
+            io.to(roomDetails.code).emit('timerUpdate', timeRemaining);
           } catch (error) {
-            console.error('Error updating timer:', error);
-            clearInterval(timer);
+            console.error(`Error updating timer for room ${roomDetails.code}:`, error instanceof Error ? error.message : 'Unknown error');
+            // Don't clear the interval here - try again on next tick
           }
         }, 1000);
       } catch (error) {
-        console.error('Error starting timer:', error);
+        console.error(`Error starting timer for room ${roomCode}:`, error instanceof Error ? error.message : 'Unknown error');
       }
     };
 
@@ -1340,55 +1483,92 @@ app.prepare()
      * Judge the answers and update scores
      */
     async function judgeAnswers(roomCode: string) {
+      const startTime = Date.now();
+      console.log(`[judgeAnswers] STARTED at ${new Date().toISOString()} for room ${roomCode}`);
+      
       try {
         console.log(`[judgeAnswers] Starting judging process for room ${roomCode}`);
         
-        // Find the room
-        const room = await Room.findOne({ code: roomCode });
+        // Find the room - only fetch necessary fields
+        await connectToDatabase(); // Ensure DB connection
+        console.log(`[judgeAnswers] DB connection established at +${Date.now() - startTime}ms`);
+        
+        const room = await Room.findOne(
+          { code: roomCode },
+          {
+            'gameState.status': 1,
+            'gameState.currentCategory': 1,
+            'gameState.judgingStyle': 1,
+            'gameState.question': 1,
+            'gameState.answers': 1,
+            'gameState.scores': 1,
+            'gameState.round': 1,
+            'gameState.roundHistory': 1,
+            'players': 1
+          }
+        );
+        console.log(`[judgeAnswers] Room query completed at +${Date.now() - startTime}ms`);
+        
         if (!room || !room.gameState) {
           console.log('[judgeAnswers] Room not found or game state missing');
           return;
         }
         
         console.log(`[judgeAnswers] Room found, current status: ${room.gameState.status}`);
+        console.log(`[judgeAnswers] Room has ${room.players.length} players, ${room.players.filter((p: Player) => p.isConnected).length} connected`);
         
-        // Update status to judging
+        // Update status to judging - single database operation
+        console.log(`[judgeAnswers] Updating status to 'judging' at +${Date.now() - startTime}ms`);
         await Room.updateOne(
           { code: roomCode },
           { $set: { 'gameState.status': 'judging' } }
         );
         
-        console.log(`[judgeAnswers] Updated room status to 'judging'`);
+        console.log(`[judgeAnswers] Updated room status to 'judging' at +${Date.now() - startTime}ms`);
         
-        const updatedRoom = await Room.findOne({ code: roomCode });
-        io.to(roomCode).emit('roomUpdate', updatedRoom);
+        // We don't need to fetch the room again, just use what we have
+        const gameStateUpdate = { ...room.gameState.toObject(), status: 'judging' };
+        io.to(roomCode).emit('roomUpdate', formatRoomForClient({ ...room.toObject(), gameState: gameStateUpdate }));
         io.to(roomCode).emit('judgingStarted');
         
-        console.log(`[judgeAnswers] Notified all players that judging has started`);
+        console.log(`[judgeAnswers] Notified all players that judging has started at +${Date.now() - startTime}ms`);
         
-        // Get the answers, category, and question
-        const gameState = updatedRoom.gameState;
-        const answers = gameState.answers || {};
+        // Get the answers, category, and question - convert to plain JS objects to avoid Mongoose issues
+        const gameState = room.gameState;
         const category = gameState.currentCategory as GameCategory;
         const judgingStyle = gameState.judgingStyle as JudgingStyle;
         const question = gameState.question || '';
         
-        // Convert Mongoose Map to plain object if needed
+        // Convert Mongoose Map to plain object and ensuring no internal properties
         let answersObj: Record<string, string> = {};
-        if (answers instanceof Map) {
-          // Convert standard Map to object
-          answersObj = Object.fromEntries(answers);
-        } else if (answers instanceof Object && typeof answers.toJSON === 'function') {
-          // Handle Mongoose Map/Document with toJSON method
-          const jsonObj = answers.toJSON();
-          for (const [key, value] of Object.entries(jsonObj)) {
-            if (!key.startsWith('$')) { // Skip Mongoose internal keys
-              answersObj[key] = value as string;
-            }
+        
+        console.log(`[judgeAnswers] Processing answers object at +${Date.now() - startTime}ms`);
+        console.log(`[judgeAnswers] Answer type: ${typeof gameState.answers}, isMap: ${gameState.answers instanceof Map}`);
+        
+        // Handle different types of answer objects properly
+        if (gameState.answers) {
+          if (gameState.answers instanceof Map) {
+            // Standard Map
+            console.log(`[judgeAnswers] Processing answers as Map`);
+            answersObj = Object.fromEntries(gameState.answers);
+          } else if (typeof gameState.answers.toJSON === 'function') {
+            // Mongoose document with toJSON
+            console.log(`[judgeAnswers] Processing answers using toJSON()`);
+            const jsonObj = gameState.answers.toJSON();
+            Object.keys(jsonObj).forEach(key => {
+              if (!key.startsWith('$')) { // Skip Mongoose internal keys
+                answersObj[key] = jsonObj[key];
+              }
+            });
+          } else if (typeof gameState.answers === 'object') {
+            // Plain object or Mongoose object without toJSON
+            console.log(`[judgeAnswers] Processing answers as plain object`);
+            Object.keys(gameState.answers).forEach(key => {
+              if (!key.startsWith('$')) { // Skip Mongoose internal keys
+                answersObj[key] = gameState.answers[key];
+              }
+            });
           }
-        } else {
-          // It's already an object
-          answersObj = answers as Record<string, string>;
         }
         
         console.log(`[judgeAnswers] Answers to judge:`, answersObj);
@@ -1396,76 +1576,123 @@ app.prepare()
         console.log(`[judgeAnswers] Question: ${question}`);
         
         // Use AI to judge the answers
-        console.log(`[judgeAnswers] Sending request to AI service for judging...`);
-        const judgingResult = await AIService.judgeAnswers(
-          category,
-          judgingStyle,
-          question,
-          answersObj
-        );
+        console.log(`[judgeAnswers] Sending request to AI service for judging at +${Date.now() - startTime}ms`);
+        let judgingResult;
+        try {
+          judgingResult = await AIService.judgeAnswers(
+            category,
+            judgingStyle,
+            question,
+            answersObj
+          );
+          console.log(`[judgeAnswers] AI judgment received at +${Date.now() - startTime}ms:`, judgingResult);
+        } catch (aiError) {
+          console.error(`[judgeAnswers] Error from AI service at +${Date.now() - startTime}ms:`, aiError instanceof Error ? aiError.message : 'Unknown error');
+          // We'll handle this in the fallback mechanism below
+        }
         
-        console.log(`[judgeAnswers] AI judgment received:`, judgingResult);
+        // Fallback mechanism - select random winner if AI service failed or returned no winners
+        if (!judgingResult || !judgingResult.winners || judgingResult.winners.length === 0) {
+          console.log(`[judgeAnswers] WARNING: No winners returned by AI, selecting random winner at +${Date.now() - startTime}ms`);
+          
+          // Select a random winner if we have answers
+          if (Object.keys(answersObj).length > 0) {
+            const randomPlayer = Object.keys(answersObj)[Math.floor(Math.random() * Object.keys(answersObj).length)];
+            judgingResult = {
+              winners: [randomPlayer],
+              explanation: "The AI judge is currently on break, so a random winner was selected."
+            };
+            console.log(`[judgeAnswers] Selected random winner: ${randomPlayer}`);
+          } else {
+            judgingResult = {
+              winners: [],
+              explanation: "No answers were submitted, so no winner was selected."
+            };
+            console.log(`[judgeAnswers] No answers to judge`);
+          }
+        }
+
         console.log(`[judgeAnswers] Winners:`, judgingResult.winners);
         
-        // Award points to winners (3 points each)
-        const pointsPerWin = 3;
-        const updatedScores = { ...(gameState.scores || {}) };
+        // Process scores - convert to plain object to avoid Mongoose issues
+        console.log(`[judgeAnswers] Processing scores object at +${Date.now() - startTime}ms`);
+        let scoreObj: Record<string, number> = {};
         
-        judgingResult.winners.forEach((playerId: string) => {
-          updatedScores[playerId] = (updatedScores[playerId] || 0) + pointsPerWin;
-          console.log(`[judgeAnswers] Awarded ${pointsPerWin} points to player ${playerId}`);
+        // Convert the scores to a safe format we can modify
+        if (gameState.scores) {
+          console.log(`[judgeAnswers] Converting scores using JSON.stringify/parse`);
+          scoreObj = JSON.parse(JSON.stringify(gameState.scores));
+        }
+        
+        console.log(`[judgeAnswers] Scores processed at +${Date.now() - startTime}ms:`, scoreObj);
+        
+        // Award points to winners (3 points per winner)
+        judgingResult.winners.forEach(winnerId => {
+          // Initialize score if not exists
+          if (!scoreObj[winnerId]) {
+            scoreObj[winnerId] = 0;
+          }
+          
+          // Add 3 points
+          scoreObj[winnerId] += 3;
+          console.log(`[judgeAnswers] Awarded 3 points to player ${winnerId}`);
         });
         
-        // Save the round history
-        // Create a clean version of the answers object for storage
-        const cleanAnswers: Record<string, string> = {};
-        Object.keys(answersObj).forEach((key: string) => {
-          cleanAnswers[key] = answersObj[key];
-        });
+        // Process round history
+        console.log(`[judgeAnswers] Processing round history at +${Date.now() - startTime}ms`);
+        const currentRound = gameState.round;
         
-        const roundHistory = [...(gameState.roundHistory || [])];
-        roundHistory.push({
-          round: gameState.round,
-          category,
-          question,
-          answers: cleanAnswers,
-          winners: judgingResult.winners,
-          explanation: judgingResult.explanation
-        });
+        // Add this round to history if not already there
+        let roundHistory = gameState.roundHistory || [];
+        if (!roundHistory[currentRound - 1]) {
+          roundHistory[currentRound - 1] = {
+            round: currentRound,
+            category: category,
+            question: question,
+            answers: answersObj,
+            winners: judgingResult.winners,
+            explanation: judgingResult.explanation
+          };
+          
+          console.log(`[judgeAnswers] Added round to history. Total rounds in history: ${roundHistory.length}`);
+        }
         
-        console.log(`[judgeAnswers] Added round to history. Total rounds in history: ${roundHistory.length}`);
-        
-        // Update the game state with judging results and scores
-        console.log(`[judgeAnswers] Updating game state to 'results'`);
+        // Update everything in one database operation
+        console.log(`[judgeAnswers] Updating game state with results at +${Date.now() - startTime}ms`);
         await Room.updateOne(
           { code: roomCode },
           { 
             $set: { 
               'gameState.status': 'results',
-              'gameState.judgingResult': judgingResult,
-              'gameState.scores': updatedScores,
+              'gameState.judgingResult': {
+                winners: judgingResult.winners,
+                explanation: judgingResult.explanation
+              },
+              'gameState.scores': scoreObj,
               'gameState.roundHistory': roundHistory
-            } 
+            }
           }
         );
         
-        const finalUpdatedRoom = await Room.findOne({ code: roomCode });
-        console.log(`[judgeAnswers] Final room status: ${finalUpdatedRoom.gameState.status}`);
+        console.log(`[judgeAnswers] Game state updated at +${Date.now() - startTime}ms`);
         
-        console.log(`[judgeAnswers] Emitting final roomUpdate to all players`);
-        broadcastRoomUpdate(roomCode, finalUpdatedRoom);
+        // Fetch final updated room
+        const finalRoom = await Room.findOne({ code: roomCode });
+        console.log(`[judgeAnswers] Final room status: ${finalRoom?.gameState?.status}`);
         
-        console.log(`[judgeAnswers] Emitting judgingComplete to all players`);
-        io.to(roomCode).emit('judgingComplete', {
-          judgingResult,
-          scores: updatedScores
-        });
+        // Notify all players
+        console.log(`[judgeAnswers] Emitting final roomUpdate to all players at +${Date.now() - startTime}ms`);
+        broadcastRoomUpdate(roomCode, finalRoom);
         
-        console.log(`[judgeAnswers] Judging process complete for room ${roomCode}`);
+        console.log(`[judgeAnswers] Emitting judgingComplete event to all players at +${Date.now() - startTime}ms`);
+        io.to(roomCode).emit('judgingComplete', judgingResult);
         
+        console.log(`[judgeAnswers] Judging process complete for room ${roomCode} at +${Date.now() - startTime}ms`);
       } catch (error) {
-        console.error('Error judging answers:', error);
+        console.error(`[judgeAnswers] Error in judging process:`, error instanceof Error ? error.message : 'Unknown error');
       }
+      
+      console.log(`[judgeAnswers] FUNCTION ENDED at ${new Date().toISOString()} (total: ${Date.now() - startTime}ms)`);
     }
 
     /**

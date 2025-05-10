@@ -5,7 +5,7 @@
 // Tell Next.js this is a dynamic route that should not be statically generated
 export const dynamic = 'force-dynamic';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useSocket } from '@/lib/hooks/useSocket';
 import { Room } from '@/types/room';
@@ -23,6 +23,7 @@ import { Loader2, Users, Crown, Trophy, CheckCircle2, XCircle, PlayCircle, Timer
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'react-hot-toast';
 import { CopyIcon } from 'lucide-react';
+import { GetRoom } from '@/types/apiTypes';
 
 /**
  * Format time in MM:SS format
@@ -51,48 +52,82 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const [showResults, setShowResults] = useState(false);
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [answerCount, setAnswerCount] = useState<{count: number, total: number}>({count: 0, total: 0});
+  const [judgingTimeout, setJudgingTimeout] = useState<number | null>(null);
+  const [gameResults, setGameResults] = useState<any>(null);
   
   // Environment flags for debug panel
   const isProduction = process.env.NODE_ENV === 'production';
   const isLocal = process.env.NODE_ENV === 'development';
 
-  // Define fetchRoom function at component level so it can be used throughout the component
-  const fetchRoom = async () => {
+  // Helper functions
+  const fetchRoom = async (code: string) => {
     try {
-      console.log(`Fetching room data for ${params.code}`);
-      const response = await fetch(`/api/rooms?code=${params.code}`);
-      if (!response.ok) throw new Error('Failed to fetch room');
-      const data = await response.json();
-      console.log('Room data received:', data);
-      setRoom(data);
-      
-      // Set playerInfo in localStorage
-      const storedPlayerId = localStorage.getItem(`room_${params.code}_playerId`);
-      const storedNickname = localStorage.getItem(`room_${params.code}_nickname`);
-      if (storedPlayerId && storedNickname) {
-        const playerInfo = {
-          playerId: storedPlayerId,
-          roomCode: params.code,
-          nickname: storedNickname
-        };
-        localStorage.setItem('playerInfo', JSON.stringify(playerInfo));
-      } else {
-        // If we don't have the player info, redirect to home
-        console.log('No player info found during fetch, redirecting to home');
-        router.push('/');
-        return;
+      const response = await fetch(`/api/rooms?code=${code}`, { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error('Failed to fetch room');
       }
+      return await response.json();
     } catch (error) {
-      setError('Failed to load room');
       console.error('Error fetching room:', error);
-    } finally {
-      setLoading(false);
+      return null;
     }
   };
 
+  // Force refresh the game state
+  const forceRefreshGameState = useCallback(async () => {
+    console.log("Forcing game state refresh");
+    setLoading(true);
+    try {
+      const freshRoom = await fetchRoom(params.code);
+      if (freshRoom) {
+        console.log("Fresh room state:", freshRoom.gameState?.status);
+        setRoom(freshRoom);
+      }
+    } catch (error) {
+      console.error("Error refreshing game state:", error);
+    } finally {
+      setLoading(false);
+    }
+  }, [params.code]);
+
   // Fetch initial room data
   useEffect(() => {
-    fetchRoom();
+    const loadRoom = async () => {
+      setLoading(true);
+      try {
+        const data = await fetchRoom(params.code);
+        if (data) {
+          setRoom(data);
+          console.log('Initial room data loaded, state:', data.gameState?.status);
+          
+          // Set playerInfo in localStorage
+          const storedPlayerId = localStorage.getItem(`room_${params.code}_playerId`);
+          const storedNickname = localStorage.getItem(`room_${params.code}_nickname`);
+          if (storedPlayerId && storedNickname) {
+            const playerInfo = {
+              playerId: storedPlayerId,
+              roomCode: params.code,
+              nickname: storedNickname
+            };
+            localStorage.setItem('playerInfo', JSON.stringify(playerInfo));
+          } else {
+            // If we don't have the player info, redirect to home
+            console.log('No player info found during fetch, redirecting to home');
+            router.push('/');
+            return;
+          }
+        } else {
+          setError('Failed to load room');
+        }
+      } catch (error) {
+        console.error('Error in loadRoom:', error);
+        setError('Failed to load room');
+      } finally {
+        setLoading(false);
+      }
+    };
+    
+    loadRoom();
   }, [params.code, router]);
 
   // Redirect to home if not joined
@@ -114,226 +149,150 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
   }, [loading, router, params.code]);
 
-  // Set up socket event listeners
+  // Socket events
   useEffect(() => {
     if (!socket) return;
 
-    // Handle errors
-    socket.on('error', (errorMessage: string) => {
-      console.error('Socket error received:', errorMessage);
-      setError(errorMessage);
-    });
+    // Consolidated socket event handler for all game state updates
+    const handleSocketEvents = () => {
+      // Enhanced room update handler with detailed logging
+      const handleRoomUpdate = (updatedRoom: Room) => {
+        console.log(`Room update received, game state: ${updatedRoom.gameState?.status}`);
+        
+        // Check if game state has changed
+        if (room?.gameState?.status !== updatedRoom.gameState?.status) {
+          console.log(`Game state transition: ${room?.gameState?.status || 'none'} -> ${updatedRoom.gameState?.status}`);
+        }
+        
+        // Update room state
+        setRoom(updatedRoom);
+        
+        // Also update gameState for consistency
+        if (updatedRoom.gameState) {
+          setGameState(updatedRoom.gameState);
+        }
+        
+        // Update answer count if in answering state
+        if (updatedRoom.gameState?.status === 'answering') {
+          const total = updatedRoom.players.filter(p => p.isConnected).length;
+          const count = updatedRoom.gameState.answers ? Object.keys(updatedRoom.gameState.answers).length : 0;
+          setAnswerCount({ count, total });
+        }
+        
+        // Update UI based on game state
+        if (updatedRoom.gameState?.status === 'results') {
+          setShowResults(true);
+        } else if (['category-selection', 'question-display', 'answering'].includes(updatedRoom.gameState?.status || '')) {
+          setShowResults(false);
+        }
+      };
 
-    // Handle room updates
-    socket.on('roomUpdate', (updatedRoom: Room) => {
-      // Detect if we have disconnected players in this update
-      const disconnectedPlayers = updatedRoom.players.filter(p => !p.isConnected);
-      const hasDisconnectedPlayers = disconnectedPlayers.length > 0;
-      
-      console.log('Room update received', {
-        status: updatedRoom.status,
-        gameState: updatedRoom.gameState?.status,
-        players: updatedRoom.players.length,
-        playerIds: updatedRoom.players.map(p => p.id).join(','),
-        disconnectedCount: disconnectedPlayers.length
+      // Game state-specific event handlers
+      const handleGameStateUpdate = (gameState: GameState) => {
+        console.log(`Game state update received: ${gameState.status}`);
+        setGameState(gameState);
+      };
+
+      // FIX: QuestionReady now expects a GameState object (not a string)
+      const handleQuestionReady = (gameState: GameState) => {
+        console.log(`Question ready event received: ${gameState.question}`);
+        setGameState(gameState);
+        
+        // Reset UI state for question display
+        setSubmittingAnswer(false);
+        setCurrentAnswer('');
+        setShowResults(false);
+      };
+
+      const handleAnsweringStarted = () => {
+        console.log("Answering started event received");
+        // Clear answer fields and prepare UI
+        setCurrentAnswer('');
+        setSubmittingAnswer(false);
+        setAnswerCount({count: 0, total: 0});
+        setTimeLeft(180); // Default timer
+      };
+
+      const handleJudgingStarted = () => {
+        console.log("Judging started event received");
+      };
+
+      const handleJudgingComplete = (data: { judgingResult: any; scores: Record<string, number> }) => {
+        console.log("Judging complete event received:", data);
+        setShowResults(true);
+      };
+
+      const handleRoundResults = (results: any) => {
+        console.log("Round results event received:", results);
+        setShowResults(true);
+      };
+
+      const handleTimeUpdate = (seconds: number) => {
+        console.log(`Time update: ${seconds}s remaining`);
+        setTimeLeft(seconds);
+      };
+
+      const handleGameEnded = (results: any) => {
+        console.log("Game ended event received:", results);
+        setGameResults(results);
+        setShowResults(true);
+      };
+
+      const handleAnswerCountUpdate = (data: { count: number; total: number }) => {
+        console.log(`Answer count update: ${data.count}/${data.total}`);
+        setAnswerCount(data);
+      };
+
+      // Register all event handlers
+      socket.on('roomUpdate', handleRoomUpdate);
+      socket.on('gameStarted', handleGameStateUpdate);
+      socket.on('roundStarted', handleGameStateUpdate);
+      socket.on('questionReady', handleQuestionReady);
+      socket.on('answeringStarted', handleAnsweringStarted);
+      socket.on('judgingStarted', handleJudgingStarted);
+      socket.on('judgingComplete', handleJudgingComplete);
+      socket.on('roundResults', handleRoundResults);
+      socket.on('timerUpdate', handleTimeUpdate);
+      socket.on('answerCountUpdate', handleAnswerCountUpdate);
+      socket.on('gameEnded', handleGameEnded);
+
+      // Error and room management events
+      socket.on('error', (errorMessage: any) => {
+        console.error('Socket error received:', errorMessage);
+        // Handle both string and object error messages
+        if (typeof errorMessage === 'object' && errorMessage.message) {
+          setError(errorMessage.message);
+        } else if (typeof errorMessage === 'string') {
+          setError(errorMessage);
+        } else {
+          setError('An unexpected error occurred');
+        }
       });
-      
-      // Track player changes
-      if (room?.players) {
-        const currentPlayerIds = room.players.map(p => p.id);
-        const updatedPlayerIds = updatedRoom.players.map(p => p.id);
-        
-        // Players who left
-        const leftPlayers = room.players.filter(p => !updatedPlayerIds.includes(p.id));
-        if (leftPlayers.length > 0) {
-          console.log(`Players left the room: ${leftPlayers.map(p => p.nickname).join(', ')}`);
-        }
-        
-        // Players who joined
-        const newPlayers = updatedRoom.players.filter(p => !currentPlayerIds.includes(p.id));
-        if (newPlayers.length > 0) {
-          console.log(`New players joined: ${newPlayers.map(p => p.nickname).join(', ')}`);
-        }
-        
-        // Players whose connection status changed
-        const changedPlayers = updatedRoom.players.filter(p => {
-          const oldPlayer = room.players.find(oldP => oldP.id === p.id);
-          return oldPlayer && oldPlayer.isConnected !== p.isConnected;
-        });
-        
-        if (changedPlayers.length > 0) {
-          console.log(`Players changed connection status: ${changedPlayers.map(p => 
-            `${p.nickname} (${p.isConnected ? 'connected' : 'disconnected'})`).join(', ')}`);
-        }
-      }
-      
-      // Track host status changes for current player
-      const currentPlayer = room?.players?.find(p => p.id === playerId);
-      const updatedPlayer = updatedRoom.players.find(p => p.id === playerId);
-      if (currentPlayer && updatedPlayer && currentPlayer.isHost !== updatedPlayer.isHost) {
-        console.log(`Host status changed: ${currentPlayer.isHost} -> ${updatedPlayer.isHost}`);
-        // If player became host, set isHost state
-        if (updatedPlayer.isHost) {
-          setIsHost(true);
-        }
-      }
-      
-      // Track state changes to help debug flow issues
-      if (room?.gameState?.status !== updatedRoom.gameState?.status) {
-        console.log(`Game state changed: ${room?.gameState?.status || 'none'} -> ${updatedRoom.gameState?.status}`);
-      }
-      
-      // Force state update with a fresh object to ensure React detects the change
-      setRoom({...updatedRoom});
-      
-      // Also update gameState to ensure it's in sync with room
-      if (updatedRoom.gameState) {
-        setGameState({...updatedRoom.gameState});
-      }
-      
-      // If we have disconnected players, make sure UI updates immediately
-      if (hasDisconnectedPlayers) {
-        // Force a repaint by toggling loading briefly - doesn't actually show loading UI
-        setLoading(true);
-        setTimeout(() => setLoading(false), 0);
-      }
-    });
 
-    // Handle being kicked from the room
-    socket.on('kicked', (message: string) => {
-      console.log('Kicked from room:', message);
-      
-      // Clean up localStorage
-      localStorage.removeItem(`room_${params.code}_playerId`);
-      localStorage.removeItem(`room_${params.code}_nickname`);
-      localStorage.removeItem('playerInfo');
-      
-      // Show alert and redirect to home
-      alert('You have been kicked from the room by the host.');
-      router.push('/');
-    });
-
-    // Handle room ended
-    socket.on('roomEnded', (message: string) => {
-      console.log('Room ended:', message);
-      // Clean up localStorage
-      localStorage.removeItem(`room_${params.code}_playerId`);
-      localStorage.removeItem(`room_${params.code}_nickname`);
-      localStorage.removeItem('playerInfo');
-      // Redirect to home
-      router.push('/');
-    });
-
-    // Handle game events - ensure they properly update state
-    socket.on('gameStarted', (gameState: GameState) => {
-      console.log('Game started event received', gameState);
-      setGameState(gameState);
-      // Force refresh room data to ensure UI is in sync
-      fetch(`/api/rooms?code=${params.code}`)
-        .then(response => response.json())
-        .then(data => setRoom(data))
-        .catch(error => console.error('Error fetching room after game start:', error));
-    });
-
-    socket.on('roundStarted', (gameState: GameState) => {
-      console.log('Round started event received', gameState);
-      setGameState(gameState);
-    });
-
-    socket.on('questionReady', (gameState: GameState) => {
-      console.log('Question ready event received', gameState);
-      setGameState(gameState);
-      // Clear out any previous answers and reset submission state
-      setCurrentAnswer('');
-      setSubmittingAnswer(false);
-      // Reset answer count
-      setAnswerCount({count: 0, total: 0});
-    });
-
-    socket.on('answeringStarted', () => {
-      console.log('Answering started event received');
-      // Update the local gameState to reflect the new status
-      setGameState(prevState => {
-        if (prevState) {
-          return {
-            ...prevState,
-            status: 'answering'
-          };
-        }
-        return prevState;
-      });
-      
-      // Ensure current answer is cleared at the start of answering phase
-      setCurrentAnswer('');
-      setSubmittingAnswer(false);
-      setAnswerCount({count: 0, total: 0});
-      
-      // Force refresh room data to ensure UI is in sync
-      fetch(`/api/rooms?code=${params.code}`)
-        .then(response => response.json())
-        .then(data => setRoom(data))
-        .catch(error => console.error('Error fetching room after answering started:', error));
-    });
-
-    socket.on('timeUpdate', (timeRemaining: number) => {
-      console.log(`Time update received: ${timeRemaining} seconds remaining`);
-      setTimeLeft(timeRemaining);
-    });
-
-    socket.on('answerRecorded', (answeredPlayerId: string) => {
-      console.log('Answer recorded for player', answeredPlayerId);
-      // Don't reset submittingAnswer here - it should stay true until next question
-    });
-
-    socket.on('answerCountUpdate', (data: { count: number; total: number }) => {
-      console.log(`Answers received: ${data.count}/${data.total}`);
-      setAnswerCount(data);
-    });
-
-    socket.on('judgingStarted', () => {
-      console.log('Judging started');
-    });
-
-    socket.on('judgingComplete', (data: { judgingResult: any; scores: Record<string, number> }) => {
-      console.log('Judging complete', data);
-      
-      // Set showResults to true when judging is complete
-      setShowResults(true);
-      
-      // Force refresh room data to ensure UI is in sync
-      fetch(`/api/rooms?code=${params.code}`)
-        .then(response => response.json())
-        .then(data => setRoom(data))
-        .catch(error => console.error('Error fetching room after judging complete:', error));
-    });
-
-    socket.on('gameOver', (gameState: GameState) => {
-      console.log('Game over event received', gameState);
-      setGameState(gameState);
-      setShowResults(true);
-    });
-
-    // Also listen for clearRoomStorage event as a backup
-    socket.on('clearRoomStorage', (data: { roomCode: string }) => {
-      console.log('Received clearRoomStorage event from server');
-      if (data.roomCode === params.code) {
-        // We've been kicked or removed, show alert and redirect
-        toast.error('You have been removed from the room');
+      socket.on('kicked', (message: string) => {
+        console.log('Kicked from room:', message);
         
         // Clean up localStorage
         localStorage.removeItem(`room_${params.code}_playerId`);
         localStorage.removeItem(`room_${params.code}_nickname`);
         localStorage.removeItem('playerInfo');
         
+        // Show alert and redirect to home
+        alert('You have been kicked from the room by the host.');
+        router.push('/');
+      });
+
+      socket.on('roomEnded', (message: string) => {
+        console.log('Room ended:', message);
+        // Clean up localStorage
+        localStorage.removeItem(`room_${params.code}_playerId`);
+        localStorage.removeItem(`room_${params.code}_nickname`);
+        localStorage.removeItem('playerInfo');
         // Redirect to home
         router.push('/');
-      }
-    });
+      });
 
-    // Update socket handling for reconnection
-    if (socket && isConnected && params.code) {
-      // Handle room joined event
-      const handleRoomJoined = (data: { 
+      socket.on('roomJoined', (data: { 
         roomCode: string;
         playerId: string;
         isHost: boolean;
@@ -348,38 +307,36 @@ export default function RoomPage({ params }: { params: { code: string } }) {
         setPlayerId(data.playerId);
         setIsHost(data.isHost);
         
-        // Fetch the latest room state after connection
-        fetchRoom();
-      };
-      
-      // Add event listener
-      socket.on('roomJoined', handleRoomJoined);
-      
-      // Remove previous listener if it exists
-      return () => {
-        socket.off('roomJoined', handleRoomJoined);
-      };
-    }
+        // Fetch the latest room state
+        forceRefreshGameState();
+      });
 
-    return () => {
-      // Clean up event listeners
-      socket.off('roomUpdate');
-      socket.off('roomEnded');
-      socket.off('gameStarted');
-      socket.off('roundStarted');
-      socket.off('questionReady');
-      socket.off('answeringStarted');
-      socket.off('timeUpdate');
-      socket.off('answerRecorded');
-      socket.off('answerCountUpdate');
-      socket.off('judgingStarted');
-      socket.off('judgingComplete');
-      socket.off('gameOver');
-      socket.off('kicked');
-      socket.off('error');
-      socket.off('clearRoomStorage');
+      // Clean up function to remove all event listeners
+      return () => {
+        socket.off('roomUpdate');
+        socket.off('gameStarted');
+        socket.off('roundStarted');
+        socket.off('questionReady');
+        socket.off('answeringStarted');
+        socket.off('judgingStarted');
+        socket.off('judgingComplete');
+        socket.off('roundResults');
+        socket.off('timerUpdate');
+        socket.off('answerCountUpdate');
+        socket.off('gameEnded');
+        socket.off('error');
+        socket.off('kicked');
+        socket.off('roomEnded');
+        socket.off('roomJoined');
+      };
     };
-  }, [socket, params.code, router, room?.gameState?.status, isConnected]);
+
+    // Initialize event handlers
+    const cleanup = handleSocketEvents();
+    
+    // Return cleanup function
+    return cleanup;
+  }, [socket, room?.gameState?.status, params.code, router, forceRefreshGameState]);
 
   // Effect to sync the game state and UI
   useEffect(() => {
@@ -387,7 +344,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     if (!room?.gameState) return;
     
     const { status, timeRemaining } = room.gameState;
-    console.log(`Game status changed to: ${status}, time remaining: ${timeRemaining || 'none'}`);
+    console.log(`Game state change detected: ${status}, time remaining: ${timeRemaining || 'none'}`);
     
     // Track and handle state changes explicitly
     switch (status) {
@@ -397,6 +354,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
         setSubmittingAnswer(false);
         setCurrentAnswer('');
         setTimeLeft(null);
+        console.log('UI updated for category selection state');
         break;
         
       case 'question-display':
@@ -405,64 +363,43 @@ export default function RoomPage({ params }: { params: { code: string } }) {
         setSubmittingAnswer(false);
         setCurrentAnswer('');
         setTimeLeft(null);
+        console.log('UI updated for question display state');
         break;
         
       case 'answering':
         // Answering phase - initialize timer
         setShowResults(false);
         if (typeof timeRemaining === 'number') {
-          console.log(`Initializing timer to ${timeRemaining} seconds from game state`);
+          console.log(`Setting timer to ${timeRemaining} seconds from game state`);
           setTimeLeft(timeRemaining);
         }
+        console.log('UI updated for answering state');
         break;
         
       case 'judging':
         // Judging phase - AI is evaluating answers
         setShowResults(false);
-        console.log('Game entered judging phase');
+        console.log('UI updated for judging phase');
         break;
         
       case 'results':
         // Results phase - show the round results
         setShowResults(true);
         setTimeLeft(null);
-        console.log('Game entered results phase, showing results screen');
+        console.log('UI updated for results phase, showing results screen');
         break;
         
       case 'game-over':
         // Game over phase
         setShowResults(true);
         setTimeLeft(null);
-        console.log('Game is over, showing final results');
+        console.log('UI updated for game over phase, showing final results');
         break;
         
       default:
-        console.log(`Unknown game status: ${status}`);
+        console.log(`Unknown game status: ${status}, unable to update UI`);
     }
   }, [room?.gameState?.status, room?.gameState?.timeRemaining]);
-  
-  // Socket event listener for time updates
-  useEffect(() => {
-    if (!socket) return;
-    
-    const handleTimeUpdate = (seconds: number) => {
-      console.log(`Time update received: ${seconds}s remaining`);
-      setTimeLeft(seconds);
-      
-      // If time reaches zero, prepare for transition to results
-      if (seconds === 0) {
-        console.log('Timer reached zero, preparing for results view');
-        // We don't immediately set showResults here as we wait for the server
-        // to send the state update with status 'results'
-      }
-    };
-    
-    socket.on('timeUpdate', handleTimeUpdate);
-    
-    return () => {
-      socket.off('timeUpdate', handleTimeUpdate);
-    };
-  }, [socket]);
 
   // React to host status changes
   useEffect(() => {
@@ -535,6 +472,39 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
   }, [room?.players]);
 
+  // Add the useEffect callback for game state changes
+  useEffect(() => {
+    console.log(`[DEBUG] Game state triggered render: ${room?.gameState?.status}`);
+    
+    // Log detailed game state for debugging
+    if (room?.gameState) {
+      console.log('Current game state:', {
+        status: room.gameState.status,
+        round: room.gameState.round,
+        question: room.gameState.question?.substring(0, 30) + '...',
+        categorySelector: room.gameState.categorySelector,
+        answerCount: room.gameState.answers ? Object.keys(room.gameState.answers).length : 0
+      });
+    }
+  }, [room?.gameState]);
+
+  // Add effect to track when judging state begins and enable debug button after 5 seconds
+  useEffect(() => {
+    if (room?.gameState?.status === 'judging') {
+      // Start a timeout to enable the debug button after 5 seconds
+      const timeoutId = window.setTimeout(() => {
+        setJudgingTimeout(Date.now());
+      }, 5000);
+      
+      return () => {
+        window.clearTimeout(timeoutId);
+      };
+    } else {
+      // Reset the timeout state when not in judging
+      setJudgingTimeout(null);
+    }
+  }, [room?.gameState?.status]);
+
   /**
    * Event Handlers
    */
@@ -543,16 +513,27 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     socket.emit('startGame');
   };
 
-  const handleSelectCategory = async (category: GameCategory) => {
+  const handleSelectCategory = (category: string) => {
     if (!socket) return;
+    
     console.log(`Selecting category: ${category}`);
-    setLoading(true); // Add loading state during category selection
+    setLoading(true);
+    
     try {
       socket.emit('selectCategory', category);
+      
+      // Show immediate feedback 
+      toast.success(`Category "${category}" selected!`);
+      
+      // Client-side UI update to show waiting state
+      setSubmittingAnswer(false);
+      setCurrentAnswer('');
+      
     } catch (error) {
       console.error('Error selecting category:', error);
+      toast.error('Failed to select category. Please try again.');
     } finally {
-      setTimeout(() => setLoading(false), 1000); // Reset loading after a delay
+      setLoading(false);
     }
   };
 
@@ -645,27 +626,34 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
   };
 
-  // Manual reconnection/state check function for debugging
-  const forceRefreshGameState = () => {
-    console.log('Forcing game state refresh...');
-    
-    // First try the reconnect function from useSocket
-    if (reconnect) {
-      console.log('Using reconnect function from hook...');
-      reconnect();
+  // Add improved logging for game state transitions
+  useEffect(() => {
+    if (room?.gameState?.status) {
+      console.log(`Game state changed to: ${room.gameState.status}`);
+      
+      // Reset UI states based on game state changes
+      if (room.gameState.status === 'category-selection') {
+        setShowResults(false);
+        setCurrentAnswer('');
+        setSubmittingAnswer(false);
+      } else if (room.gameState.status === 'question-display') {
+        setShowResults(false);
+        setCurrentAnswer('');
+        setSubmittingAnswer(false);
+      } else if (room.gameState.status === 'results') {
+        setShowResults(true);
+      }
     }
+  }, [room?.gameState?.status]);
+
+  // Function to manually trigger the judging process
+  const handleManualJudging = () => {
+    if (!socket) return;
     
-    // Also refresh game state from API
-    fetch(`/api/rooms?code=${params.code}`)
-      .then(response => response.json())
-      .then(data => {
-        console.log('Refreshed room data:', data);
-        setRoom(data);
-        if (data.gameState) {
-          setGameState(data.gameState);
-        }
-      })
-      .catch(error => console.error('Error refreshing game state:', error));
+    console.log('Manually triggering judging process');
+    socket.emit('triggerJudging');
+    
+    toast.success('Attempting to restart judging process...');
   };
 
   /**
@@ -767,14 +755,53 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                 {process.env.NODE_ENV === 'development' && (
                   <div className="mb-2 p-2 bg-blue-50 rounded text-xs">
                     <p>Current game state: {room?.gameState?.status}</p>
+                    <p>Players connected: {room.players.filter(p => p.isConnected).length}/{room.players.length}</p>
                   </div>
                 )}
                 
                 {showResults ? (
                   // Results view
                   <div className="text-center">
-                    <h2 className="text-2xl font-bold mb-4">Results</h2>
-                    {room?.gameState?.round ? (
+                    <h2 className="text-2xl font-bold mb-4">
+                      {room?.gameState?.status === 'game-over' ? 'Game Over' : 'Results'}
+                    </h2>
+                    
+                    {room?.gameState?.status === 'game-over' && gameResults ? (
+                      // Final Game Results
+                      <div>
+                        <p className="mb-4 text-lg">Final Standings</p>
+                        <div className="my-4 space-y-3">
+                          {Object.entries(gameResults.finalScores || {})
+                            .sort(([, a], [, b]) => (Number(b) - Number(a)))
+                            .map(([playerId, score], index) => {
+                              const player = room.players.find(p => p.id === playerId);
+                              return (
+                                <div key={playerId} className={`p-4 ${index === 0 ? 'bg-yellow-100' : 'bg-gray-100'} rounded-lg flex justify-between items-center`}>
+                                  <div className="flex items-center gap-2">
+                                    {index === 0 && <Trophy className="w-5 h-5 text-yellow-600" />}
+                                    <span className="font-semibold">{index + 1}. {player?.nickname || 'Unknown'}</span>
+                                    {player?.id === playerId && <span className="text-blue-600 text-sm">(You)</span>}
+                                  </div>
+                                  <span className="px-3 py-1.5 bg-blue-100 text-blue-800 font-bold rounded-full">
+                                    {score} pts
+                                  </span>
+                                </div>
+                              );
+                            })}
+                        </div>
+                        
+                        <div className="mt-8">
+                          <Button 
+                            variant="outline" 
+                            className="w-full"
+                            onClick={handleLeaveRoom}
+                          >
+                            Return to Home
+                          </Button>
+                        </div>
+                      </div>
+                    ) : room?.gameState?.round ? (
+                      // Round Results
                       <div>
                         <p className="mb-2 text-lg">Round {room.gameState.round} / {room.gameState.totalRounds || 5}</p>
                         <div className="my-4">
@@ -787,10 +814,12 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                             {room.gameState.answers && Object.entries(room.gameState.answers).map(([playerId, answer]) => {
                               const playerName = room.players.find(p => p.id === playerId)?.nickname || 'Unknown';
                               const points = room.gameState?.scores?.[playerId] || 0;
+                              const isWinner = room.gameState?.judgingResult?.winners?.includes(playerId);
                               return (
-                                <li key={playerId} className="p-3 bg-gray-100 rounded-lg flex justify-between items-center">
+                                <li key={playerId} className={`p-3 ${isWinner ? 'bg-green-100' : 'bg-gray-100'} rounded-lg flex justify-between items-center`}>
                                   <span><strong>{playerName}:</strong> {answer}</span>
-                                  <span className="px-2 py-1 bg-blue-100 text-blue-800 rounded-full text-sm">
+                                  <span className={`px-2 py-1 ${isWinner ? 'bg-green-100 text-green-800' : 'bg-blue-100 text-blue-800'} rounded-full text-sm flex items-center gap-1`}>
+                                    {isWinner && <Trophy className="w-4 h-4" />}
                                     {points} pts
                                   </span>
                                 </li>
@@ -865,7 +894,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                           <div className="h-4 bg-gray-200 rounded w-1/2 mx-auto"></div>
                         </div>
                       </div>
-                    ) : room?.gameState?.status === 'answering' && room?.gameState?.question ? (
+                    ) : room?.gameState?.status === 'answering' ? (
                       <div className="text-center">
                         <div className="mb-4">
                           <h2 className="text-2xl font-bold mb-2">Round {room.gameState.round} / {room.gameState.totalRounds || 5}</h2>
@@ -937,21 +966,26 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                           <p>The AI is judging all the answers...</p>
                           <p className="text-sm text-gray-500 mt-2">This may take a few moments</p>
                         </div>
+                        {judgingTimeout && (
+                          <div className="mt-4">
+                            <p className="text-yellow-500 mb-2">Seems like judging is taking too long...</p>
+                            <Button 
+                              variant="destructive" 
+                              onClick={handleManualJudging}
+                              className="w-full"
+                            >
+                              Debug: Force Complete Judging
+                            </Button>
+                          </div>
+                        )}
                       </div>
-                    ) : room?.status === 'playing' ? (
+                    ) : (
                       <div className="text-center p-6">
                         <h2 className="text-xl font-bold mb-4">Game in Progress</h2>
                         <div className="flex flex-col items-center">
                           <p>Please wait for the current phase to complete.</p>
                           <p className="text-sm text-gray-500 mt-2">Current game phase: {room?.gameState?.status || 'unknown'}</p>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="text-center p-6">
-                        <h2 className="text-xl font-bold mb-2">Waiting for the host to start the game...</h2>
-                        <div className="animate-pulse mt-4">
-                          <div className="h-4 bg-gray-200 rounded w-3/4 mx-auto mb-2.5"></div>
-                          <div className="h-4 bg-gray-200 rounded mx-auto"></div>
+                          <Loader2 className="h-6 w-6 animate-spin mt-4" />
                         </div>
                       </div>
                     )}

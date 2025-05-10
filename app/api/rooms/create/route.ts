@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { connectToDatabase } from '@/lib/mongodb';
 import { Room } from '@/models/Room';
 import { v4 as uuidv4 } from 'uuid';
+import { AIService } from '@/lib/ai/aiService';
 
 function generateRoomCode(): string {
   return Math.floor(1000 + Math.random() * 9000).toString();
@@ -19,6 +20,15 @@ export async function POST(req: Request) {
     await connectToDatabase();
     const playerId = uuidv4();
     const roomCode = generateRoomCode();
+
+    // Prefetch all category questions when a room is created
+    // This happens asynchronously and doesn't block room creation
+    AIService.fetchAllCategoryQuestions().then(() => {
+      console.log(`[AIService] Successfully prefetched all category questions for room ${roomCode}`);
+    }).catch(error => {
+      console.error(`[AIService] Error prefetching questions for room ${roomCode}:`, error);
+      // Even if prefetching fails, it's not critical - we'll fall back later
+    });
 
     // Create a new room with the player as host
     const room = new Room({

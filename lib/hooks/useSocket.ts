@@ -35,11 +35,21 @@ export function useSocket() {
         playerInfo = JSON.parse(playerInfoStr);
       } catch (e) {
         console.error('Failed to parse player info:', e);
+        localStorage.removeItem('playerInfo'); // Clean up invalid data
         return;
       }
 
-      if (!playerInfo.playerId || !playerInfo.roomCode || !playerInfo.nickname) {
+      // Ensure all required fields are present and valid
+      if (!playerInfo.playerId || !playerInfo.roomCode || !playerInfo.nickname || 
+          playerInfo.roomCode === "undefined" || playerInfo.roomCode === undefined) {
         console.log('Invalid player info:', playerInfo);
+        // Clean up invalid data
+        localStorage.removeItem('playerInfo');
+        // Also clean up any room-specific data
+        if (playerInfo.roomCode) {
+          localStorage.removeItem(`room_${playerInfo.roomCode}_playerId`);
+          localStorage.removeItem(`room_${playerInfo.roomCode}_nickname`);
+        }
         return;
       }
 
@@ -111,8 +121,15 @@ export function useSocket() {
         if (storedPlayerInfo) {
           try {
             const playerInfo = JSON.parse(storedPlayerInfo);
-            if (playerInfo && playerInfo.roomCode && playerInfo.playerId && playerInfo.nickname) {
+            
+            // Validate all required fields and ensure they are not undefined
+            if (playerInfo && 
+                typeof playerInfo.roomCode === 'string' && playerInfo.roomCode && playerInfo.roomCode !== "undefined" &&
+                typeof playerInfo.playerId === 'string' && playerInfo.playerId && 
+                typeof playerInfo.nickname === 'string' && playerInfo.nickname) {
+              
               const { roomCode, playerId, nickname } = playerInfo;
+              
               console.log(`Reconnecting to room ${roomCode} with existing player info`, playerInfo);
               
               // First mark player as connected again
@@ -128,9 +145,34 @@ export function useSocket() {
                 nickname,
                 playerId
               });
+            } else {
+              console.error('Invalid player info during reconnection:', playerInfo);
+              localStorage.removeItem('playerInfo');
+              
+              // Clean up any room-specific storage as well
+              if (playerInfo && playerInfo.roomCode) {
+                localStorage.removeItem(`room_${playerInfo.roomCode}_playerId`);
+                localStorage.removeItem(`room_${playerInfo.roomCode}_nickname`);
+              }
+              
+              // Clean up any other room data
+              Object.keys(localStorage).forEach(key => {
+                if (key.startsWith('room_')) {
+                  localStorage.removeItem(key);
+                }
+              });
             }
           } catch (e) {
             console.error('Error parsing playerInfo during reconnection:', e);
+            // Clear invalid player info to prevent future errors
+            localStorage.removeItem('playerInfo');
+            
+            // Clean up any room-specific data
+            Object.keys(localStorage).forEach(key => {
+              if (key.startsWith('room_')) {
+                localStorage.removeItem(key);
+              }
+            });
           }
         } else {
           console.log('No stored playerInfo found, cannot reconnect automatically');
@@ -296,8 +338,31 @@ export function useSocket() {
         }
         
         const playerInfo = JSON.parse(playerInfoStr);
-        if (!playerInfo || !playerInfo.roomCode || !playerInfo.playerId || !playerInfo.nickname) {
+        
+        // More stringent validation to prevent undefined room issues
+        if (!playerInfo || 
+            typeof playerInfo.roomCode !== 'string' || 
+            !playerInfo.roomCode || 
+            playerInfo.roomCode === "undefined" || 
+            !playerInfo.playerId || 
+            !playerInfo.nickname) {
           console.error('Invalid player info for manual reconnection:', playerInfo);
+          
+          // Clean up invalid data
+          localStorage.removeItem('playerInfo');
+          
+          // Also clean up any room-specific storage
+          if (playerInfo && playerInfo.roomCode) {
+            localStorage.removeItem(`room_${playerInfo.roomCode}_playerId`);
+            localStorage.removeItem(`room_${playerInfo.roomCode}_nickname`);
+          }
+          
+          // Clean up any other room data
+          Object.keys(localStorage).forEach(key => {
+            if (key.startsWith('room_')) {
+              localStorage.removeItem(key);
+            }
+          });
           return;
         }
         
@@ -318,7 +383,11 @@ export function useSocket() {
               setTimeout(() => {
                 if (socketInstance.connected) {
                   console.log('Socket reconnected, explicitly joining room:', playerInfo.roomCode);
-                  socketInstance.emit('joinRoom', playerInfo.roomCode, playerInfo.playerId, playerInfo.nickname);
+                  socketInstance.emit('joinRoom', {
+                    roomCode: playerInfo.roomCode,
+                    nickname: playerInfo.nickname,
+                    playerId: playerInfo.playerId
+                  });
                 } else {
                   console.log('Socket failed to reconnect after forced disconnect');
                 }
@@ -327,13 +396,19 @@ export function useSocket() {
           } else {
             // Just try to emit joinRoom again
             console.log('Socket appears to be connected, just emitting joinRoom');
-            socketInstance.emit('joinRoom', playerInfo.roomCode, playerInfo.playerId, playerInfo.nickname);
+            socketInstance.emit('joinRoom', {
+              roomCode: playerInfo.roomCode,
+              nickname: playerInfo.nickname,
+              playerId: playerInfo.playerId
+            });
           }
         } else {
           console.error('No socket instance available for reconnection');
         }
       } catch (error) {
         console.error('Error during manual reconnection:', error);
+        // Clear playerInfo to prevent future errors
+        localStorage.removeItem('playerInfo');
       }
     } else {
       console.log('Socket is already connected, no need to reconnect');
@@ -366,30 +441,52 @@ export function useSocket() {
         // Get current room info
         const playerInfoStr = localStorage.getItem('playerInfo');
         if (playerInfoStr) {
-          const playerInfo = JSON.parse(playerInfoStr);
-          if (playerInfo.roomCode) {
-            console.log(`Emitting leaveRoom event for room ${playerInfo.roomCode}`);
-            
-            // Set timestamp when we left
-            localStorage.setItem('leftRoomAt', Date.now().toString());
-            
-            // Emit leave room event and wait for acknowledgement before disconnecting
-            socketInstance.emit('leaveRoom', playerInfo.roomCode);
-            
-            // IMPORTANT: Add a small delay before disconnecting to ensure the event is sent
-            setTimeout(() => {
-              console.log('Disconnecting socket after leaveRoom event');
-              // Disconnect socket AFTER the event has time to be sent
-              socketInstance.disconnect();
-              socketInstance = null;
-            }, 300); // Give it 300ms to ensure the event is transmitted
-            
-            return; // Exit early to prevent immediate disconnection
+          try {
+            const playerInfo = JSON.parse(playerInfoStr);
+            if (playerInfo && playerInfo.roomCode) {
+              const roomCode = playerInfo.roomCode;
+              console.log(`Emitting leaveRoom event for room ${roomCode}`);
+              
+              // Set timestamp when we left
+              localStorage.setItem('leftRoomAt', Date.now().toString());
+              
+              // Clean up ALL room-related localStorage immediately to prevent reconnection issues
+              localStorage.removeItem(`room_${roomCode}_playerId`);
+              localStorage.removeItem(`room_${roomCode}_nickname`);
+              localStorage.removeItem('playerInfo');
+              
+              // Emit leave room event and wait for acknowledgement before disconnecting
+              socketInstance.emit('leaveRoom', roomCode);
+              
+              // IMPORTANT: Add a small delay before disconnecting to ensure the event is sent
+              setTimeout(() => {
+                console.log('Disconnecting socket after leaveRoom event');
+                // Disconnect socket AFTER the event has time to be sent
+                socketInstance.disconnect();
+                socketInstance = null;
+              }, 300); // Give it 300ms to ensure the event is transmitted
+              
+              return; // Exit early to prevent immediate disconnection
+            }
+          } catch (error) {
+            console.error('Error parsing playerInfo during room leave:', error);
+            // Continue with cleanup below
           }
         }
         
         // If we don't have room info or some other issue occurred, disconnect immediately
         console.log('No room info found, disconnecting socket directly');
+        // Still clean up any localStorage items
+        localStorage.removeItem('playerInfo');
+        localStorage.removeItem('leftRoomAt');
+        
+        // Clear any possible room data by checking all localStorage keys
+        Object.keys(localStorage).forEach(key => {
+          if (key.startsWith('room_')) {
+            localStorage.removeItem(key);
+          }
+        });
+        
         socketInstance.disconnect();
         socketInstance = null;
       } catch (error) {

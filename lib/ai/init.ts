@@ -1,9 +1,9 @@
 import { initializeAIProvider } from './factory';
 
-// Initialize AI provider with Hugging Face
+// Initialize AI provider with Gemini
 initializeAIProvider({
-  type: 'huggingface',
+  type: 'gemini',
   config: {
-    apiKey: process.env.HUGGINGFACE_API_KEY
+    apiKey: process.env.GEMINI_API_KEY
   }
 }); 

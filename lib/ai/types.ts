@@ -4,7 +4,7 @@ export interface AIProvider {
 }
 
 export interface AIProviderConfig {
-  type: 'huggingface' | 'mock' | 'custom';
+  type: 'huggingface' | 'mock' | 'gemini' | 'custom';
   config: {
     apiKey?: string;
     [key: string]: any;

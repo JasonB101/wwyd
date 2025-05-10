@@ -36,6 +36,8 @@ A multiplayer game where players answer thought-provoking questions and an AI ju
    ```
    MONGODB_URI=your_mongodb_connection_string
    HF_API_KEY=your_huggingface_api_key
+   COHERE_API_KEY=your_api_key_here
+   GEMINI_API_KEY=your_api_key_here
    ```
 
 4. Start the development server:
@@ -71,3 +73,18 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## AI Question Generation
+
+This game uses Google's Gemini AI for generating creative questions and judging player answers. To enable this feature:
+
+1. Sign up for a free account at [Google AI Studio](https://aistudio.google.com/)
+2. Create an API key in the Google AI Studio dashboard
+3. Add your API key to the `.env.local` file:
+   ```
+   GEMINI_API_KEY=your_api_key_here
+   ```
+
+The free tier includes 60 requests per minute, which is more than enough for gameplay.
+
+If the API is unavailable or you don't set up a key, the game will automatically fall back to using a pre-defined set of questions.
